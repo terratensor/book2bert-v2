@@ -65,14 +65,11 @@ func ToUTF8(text []byte) (string, error) {
 }
 
 // NormalizeText нормализует текст: удаляет BOM, лишние пробелы
+// ВНИМАНИЕ: переносы строк уже нормализованы в CleanText, здесь только BOM и пробелы
 func NormalizeText(text string) string {
 	// Удаляем BOM (Byte Order Mark) если есть
 	text = strings.TrimPrefix(text, "\uFEFF")
 	text = strings.TrimPrefix(text, "\uFFFE")
-
-	// Нормализуем переносы строк
-	text = strings.ReplaceAll(text, "\r\n", "\n")
-	text = strings.ReplaceAll(text, "\r", "\n")
 
 	// Удаляем лишние пробелы в начале и конце строк
 	lines := strings.Split(text, "\n")

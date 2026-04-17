@@ -161,7 +161,7 @@ func cleanSpecialChars(text string) string {
 func processFile(ctx context.Context, task FileTask, seg segmenter.Segmenter, repo book.Repository, stats *ProcessStats, cjkLogFile *os.File, metaChan chan<- BookMeta) {
 	defer atomic.AddInt64(&stats.Processed, 1)
 
-	// 1. Читаем файл (поддерживается .txt и .txt.gz)
+	// Читаем файл (поддерживается .txt и .txt.gz)
 	var content string
 	var err error
 
@@ -177,46 +177,44 @@ func processFile(ctx context.Context, task FileTask, seg segmenter.Segmenter, re
 		return
 	}
 
-	// 2. Конвертируем кодировку (Windows-1251 → UTF-8)
+	// 0. Извлекаем метаданные из имени файла
+	genre, author, title := parseMetadataFromFilename(task.Filename)
+	if title == "" {
+		title = strings.TrimSuffix(task.Filename, ".txt.gz")
+		title = strings.TrimSuffix(title, ".txt")
+	}
+
+	// 1. Конвертируем кодировку
 	text, err := textutils.ToUTF8([]byte(content))
 	if err != nil {
 		text = content
 	}
 
-	// 3. Нормализация текста (удаление BOM, лишних переносов и т.д.)
+	// 2. Базовая нормализация (BOM, пробелы по краям строк)
 	text = textutils.NormalizeText(text)
 
-	// 4. Очистка от служебных символов и восстановление переносов
-	text = cleanSpecialChars(text)
-
-	// 5. Очистка от OCR-мусора (ISBN, URL, списки и т.д.)
+	// 3. Очистка от мусора (неразрывные пробелы, переносы, управляющие, таблицы, списки, ISBN, URL)
 	text = textutils.CleanText(text)
 
-	// 6. Удаление не-русского текста (оставляем только кириллицу)
-	text = textutils.FilterNonRussian(text)
-
-	// 7. Проверка на CJK/тайские символы (логируем и удаляем)
+	// 4. ПРОВЕРКА НА CJK (до удаления!)
 	hadCJK := textutils.HasCJKThai(text)
+
+	// 5. УДАЛЕНИЕ CJK
 	text = textutils.FilterCJKThai(text)
 
-	// 8. Логируем файлы, содержащие CJK
+	// 6. ЛОГИРОВАНИЕ CJK (после проверки)
 	if hadCJK {
 		cjkLogFile.WriteString(fmt.Sprintf("%s\t%s\t%s\t%s\n",
-			task.Filename, "", "", ""))
+			task.Filename, title, author, genre))
 	}
 
-	// 9. Пропускаем пустые файлы
+	// 7. Удаление остальных не-русских символов (латиница остаётся, но другие алфавиты — нет)
+	text = textutils.FilterNonRussian(text)
+
+	// 8. Проверка на пустоту
 	if len(strings.TrimSpace(text)) == 0 {
-		log.Printf("[SKIP] %s: empty after filtering (had CJK: %v)", task.Filename, hadCJK)
 		atomic.AddInt64(&stats.Skipped, 1)
 		return
-	}
-
-	// 10. Извлекаем метаданные из имени файла
-	genre, author, title := parseMetadataFromFilename(task.Filename)
-	if title == "" {
-		title = strings.TrimSuffix(task.Filename, ".txt.gz")
-		title = strings.TrimSuffix(title, ".txt")
 	}
 
 	// 11. Генерируем уникальный ID для книги

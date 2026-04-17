@@ -7,23 +7,33 @@ import (
 )
 
 // CleanText очищает текст от OCR-артефактов
+// Выполняет все необходимые преобразования за один проход
 func CleanText(text string) string {
-	// 1. Удаляем управляющие символы
+	// 1. Заменяем неразрывные пробелы на обычные (добавлено)
+	text = strings.ReplaceAll(text, "\u00A0", " ") // &nbsp;
+	text = strings.ReplaceAll(text, "\u2007", " ") // Figure space
+	text = strings.ReplaceAll(text, "\u202F", " ") // Narrow no-break space
+
+	// 2. Нормализуем переносы строк (уже есть в NormalizeText, но здесь на всякий случай)
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+
+	// 3. Удаляем управляющие символы (кроме \n)
 	text = regexp.MustCompile(`[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]`).ReplaceAllString(text, "")
 
-	// 2. Восстанавливаем переносы слов "внима- \n тельно" → "внимательно"
+	// 4. Восстанавливаем переносы слов "внима- \n тельно" → "внимательно"
 	text = fixHyphenatedWords(text)
 
-	// 3. Удаляем строки с метаданными (ISBN, УДК, ББК)
-	text = regexp.MustCompile(`(?m)^.*\b(?:ISBN|УДК|ББК|ISSN|DOI|УДК|ББК)\b.*$`).ReplaceAllString(text, "")
+	// 5. Удаляем строки с метаданными (ISBN, УДК, ББК)
+	text = regexp.MustCompile(`(?m)^.*\b(?:ISBN|УДК|ББК|ISSN|DOI)\b.*$`).ReplaceAllString(text, "")
 
-	// 4. Удаляем нумерацию (строки, состоящие только из цифр и точки)
+	// 6. Удаляем нумерацию (строки, состоящие только из цифр и точки)
 	text = regexp.MustCompile(`(?m)^\s*\d+\.?\s*$`).ReplaceAllString(text, "")
 
-	// 5. Удаляем оглавления (цифры в конце строки)
+	// 7. Удаляем оглавления (цифры в конце строки)
 	text = regexp.MustCompile(`([А-Яа-яЁё])(\d+)(?:\s|$)`).ReplaceAllString(text, "$1")
 
-	// 6. Удаляем строки-таблицы (много цифр и знаков)
+	// 8. Удаляем строки-таблицы (много цифр и знаков)
 	lines := strings.Split(text, "\n")
 	var cleanedLines []string
 	for _, line := range lines {
@@ -40,17 +50,17 @@ func CleanText(text string) string {
 	}
 	text = strings.Join(cleanedLines, "\n")
 
-	// 7. Удаляем специальные символы
+	// 9. Удаляем специальные символы
 	specialChars := regexp.MustCompile(`[▲►▼◄■□▪▫●○◦★☆♦✓✗→←↑↓]`)
 	text = specialChars.ReplaceAllString(text, "")
 
-	// 8. Удаляем повторяющиеся символы
+	// 10. Удаляем повторяющиеся символы
 	text = regexp.MustCompile(`(?m)^[=\-*_]{10,}$`).ReplaceAllString(text, "")
 
-	// 9. Нормализуем пробелы (один пробел вместо многих)
+	// 11. Нормализуем пробелы (один пробел вместо многих)
 	text = regexp.MustCompile(`[ \t]+`).ReplaceAllString(text, " ")
 
-	// 10. Удаляем пробелы перед знаками препинания
+	// 12. Удаляем пробелы перед знаками препинания
 	text = regexp.MustCompile(`\s+([.,!?;:])`).ReplaceAllString(text, "$1")
 
 	return strings.TrimSpace(text)
@@ -102,7 +112,7 @@ func isBibliographicLine(line string) bool {
 	return false
 }
 
-// isGarbageLine проверяет строки с битыми символам (<30% букв)
+// isGarbageLine проверяет строки с битыми символами (<30% букв)
 func isGarbageLine(line string) bool {
 	if len(line) < 10 {
 		return false
