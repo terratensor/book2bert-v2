@@ -18,11 +18,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/terratensor/book2bert/v2/pkg/adapters/filerepo"
-	segmenterAdapter "github.com/terratensor/book2bert/v2/pkg/adapters/segmenter"
-	"github.com/terratensor/book2bert/v2/pkg/core/book"
-	"github.com/terratensor/book2bert/v2/pkg/core/segmenter"
-	"github.com/terratensor/book2bert/v2/pkg/textutils"
+	"github.com/terratensor/book2bert-v2/pkg/adapters/filerepo"
+	segmenterAdapter "github.com/terratensor/book2bert-v2/pkg/adapters/segmenter"
+	"github.com/terratensor/book2bert-v2/pkg/core/book"
+	"github.com/terratensor/book2bert-v2/pkg/core/segmenter"
+	"github.com/terratensor/book2bert-v2/pkg/textutils"
 )
 
 var (
@@ -128,33 +128,6 @@ func readTXTFile(filePath string) (string, error) {
 		return "", err
 	}
 	return string(data), nil
-}
-
-// cleanSpecialChars удаляет служебные символы и восстанавливает переносы слов
-func cleanSpecialChars(text string) string {
-	// 1. Заменяем неразрывные пробелы на обычные
-	text = strings.ReplaceAll(text, "\u00A0", " ") // &nbsp;
-	text = strings.ReplaceAll(text, "\u2007", " ") // Figure space
-	text = strings.ReplaceAll(text, "\u202F", " ") // Narrow no-break space
-
-	// 2. Удаляем carriage return (оставляем только \n)
-	text = strings.ReplaceAll(text, "\r\n", "\n")
-	text = strings.ReplaceAll(text, "\r", "\n")
-
-	// 3. Восстанавливаем переносы слов: "внима- \n тельно" → "внимательно"
-	//    (дефис + перенос строки + пробелы + продолжение)
-	reHyphen := regexp.MustCompile(`(\p{L}+)-\s*\n\s*(\p{L}+)`)
-	text = reHyphen.ReplaceAllString(text, "$1$2")
-
-	// 4. Удаляем табуляции и другие управляющие символы (но сохраняем \n)
-	reControl := regexp.MustCompile(`[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]`)
-	text = reControl.ReplaceAllString(text, "")
-
-	// 5. Удаляем лишние пробелы (множественные пробелы → один)
-	reSpaces := regexp.MustCompile(`[ \t]+`)
-	text = reSpaces.ReplaceAllString(text, " ")
-
-	return text
 }
 
 // processFile обрабатывает один файл

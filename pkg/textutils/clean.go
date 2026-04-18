@@ -9,12 +9,12 @@ import (
 // CleanText очищает текст от OCR-артефактов
 // Выполняет все необходимые преобразования за один проход
 func CleanText(text string) string {
-	// 1. Заменяем неразрывные пробелы на обычные (добавлено)
+	// 1. Заменяем неразрывные пробелы на обычные
 	text = strings.ReplaceAll(text, "\u00A0", " ") // &nbsp;
 	text = strings.ReplaceAll(text, "\u2007", " ") // Figure space
 	text = strings.ReplaceAll(text, "\u202F", " ") // Narrow no-break space
 
-	// 2. Нормализуем переносы строк (уже есть в NormalizeText, но здесь на всякий случай)
+	// 2. Нормализуем переносы строк
 	text = strings.ReplaceAll(text, "\r\n", "\n")
 	text = strings.ReplaceAll(text, "\r", "\n")
 
@@ -29,6 +29,15 @@ func CleanText(text string) string {
 
 	// 6. Удаляем нумерацию (строки, состоящие только из цифр и точки)
 	text = regexp.MustCompile(`(?m)^\s*\d+\.?\s*$`).ReplaceAllString(text, "")
+
+	// Удаляем колонцифры (одиночные цифры на строке)
+	text = regexp.MustCompile(`(?m)^\s*\d+\s*$`).ReplaceAllString(text, "")
+
+	// Удаляем строки вида "95~", "123'", "45`" (артефакты номеров страниц)
+	text = regexp.MustCompile(`(?m)^\s*\d+[~'`+"`"+`"]?\s*$`).ReplaceAllString(text, "")
+
+	// Удаляем разделители
+	text = regexp.MustCompile(`(?m)^[\*\-\=]{3,}$`).ReplaceAllString(text, "")
 
 	// 7. Удаляем оглавления (цифры в конце строки)
 	text = regexp.MustCompile(`([А-Яа-яЁё])(\d+)(?:\s|$)`).ReplaceAllString(text, "$1")
@@ -57,10 +66,20 @@ func CleanText(text string) string {
 	// 10. Удаляем повторяющиеся символы
 	text = regexp.MustCompile(`(?m)^[=\-*_]{10,}$`).ReplaceAllString(text, "")
 
-	// 11. Нормализуем пробелы (один пробел вместо многих)
+	// 11. Удаляем ПУСТЫЕ СТРОКИ (добавлено)
+	lines = strings.Split(text, "\n")
+	var nonEmptyLines []string
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			nonEmptyLines = append(nonEmptyLines, line)
+		}
+	}
+	text = strings.Join(nonEmptyLines, "\n")
+
+	// 12. Нормализуем пробелы (один пробел вместо многих)
 	text = regexp.MustCompile(`[ \t]+`).ReplaceAllString(text, " ")
 
-	// 12. Удаляем пробелы перед знаками препинания
+	// 13. Удаляем пробелы перед знаками препинания
 	text = regexp.MustCompile(`\s+([.,!?;:])`).ReplaceAllString(text, "$1")
 
 	return strings.TrimSpace(text)
@@ -68,8 +87,9 @@ func CleanText(text string) string {
 
 // fixHyphenatedWords исправляет переносы слов: "внима- \n тельно" → "внимательно"
 func fixHyphenatedWords(text string) string {
+	// Сохраняем дефис: "Петров-\nВодкин" → "Петров-Водкин"
 	re := regexp.MustCompile(`(\p{L}+)-\s*\n\s*(\p{L}+)`)
-	text = re.ReplaceAllString(text, "$1$2")
+	text = re.ReplaceAllString(text, "$1-$2")
 	return text
 }
 

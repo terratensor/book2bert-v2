@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/terratensor/book2bert/v2/pkg/core/segmenter"
+	"github.com/terratensor/book2bert-v2/pkg/core/segmenter"
 )
 
 // HTTPClient адаптер для вызова HTTP-сервиса сегментации

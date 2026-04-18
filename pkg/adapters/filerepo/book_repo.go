@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/terratensor/book2bert/v2/pkg/core/book"
+	"github.com/terratensor/book2bert-v2/pkg/core/book"
 )
 
 // JSONLRepository репозиторий для хранения предложений в JSONL формате
