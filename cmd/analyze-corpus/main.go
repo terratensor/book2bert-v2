@@ -20,6 +20,36 @@ import (
 	"unicode"
 )
 
+// --- Типы для кучи (частые фразы) ---
+type heapItem struct {
+	count  int
+	phrase string
+	idx    int // из какого чанка
+}
+
+type maxHeap []heapItem
+
+func (h maxHeap) Len() int { return len(h) }
+func (h maxHeap) Less(i, j int) bool {
+	if h[i].count != h[j].count {
+		return h[i].count > h[j].count
+	}
+	return h[i].phrase < h[j].phrase
+}
+func (h maxHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *maxHeap) Push(x interface{}) {
+	*h = append(*h, x.(heapItem))
+}
+
+func (h *maxHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
 // Stats хранит агрегированную статистику
 type Stats struct {
 	// Базовые метрики
@@ -615,11 +645,6 @@ func mergeChunks(chunkFiles []string, outPath string) error {
 	}()
 
 	// Инициализируем кучу
-	type heapItem struct {
-		count  int
-		phrase string
-		idx    int // из какого чанка
-	}
 	h := &maxHeap{}
 	heap.Init(h)
 
@@ -661,39 +686,6 @@ func mergeChunks(chunkFiles []string, outPath string) error {
 		}
 	}
 	return nil
-}
-
-// maxHeap реализует кучу с максимальным элементом по count
-type maxHeap []struct {
-	count  int
-	phrase string
-	idx    int
-}
-
-func (h maxHeap) Len() int { return len(h) }
-func (h maxHeap) Less(i, j int) bool {
-	// Сортировка по убыванию count, при равном count - лексикографически
-	if h[i].count != h[j].count {
-		return h[i].count > h[j].count
-	}
-	return h[i].phrase < h[j].phrase
-}
-func (h maxHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
-
-func (h *maxHeap) Push(x interface{}) {
-	*h = append(*h, x.(struct {
-		count  int
-		phrase string
-		idx    int
-	}))
-}
-
-func (h *maxHeap) Pop() interface{} {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[0 : n-1]
-	return x
 }
 
 func main() {
