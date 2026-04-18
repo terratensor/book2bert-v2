@@ -1,0 +1,47 @@
+{
+  "32k": {
+    "vocab_size": 32000,
+    "coverage": 99.96,
+    "fertility": 1.69,
+    "unk_rate": 0.0412,
+    "total_tokens": 2143661,
+    "total_words": 1267199,
+    "avg_tokens_per_sentence": 21.4,
+    "percentiles": {
+      "p50": 17,
+      "p90": 44,
+      "p95": 55,
+      "p99": 85
+    }
+  },
+  "64k": {
+    "vocab_size": 64000,
+    "coverage": 99.96,
+    "fertility": 1.55,
+    "unk_rate": 0.0449,
+    "total_tokens": 1967143,
+    "total_words": 1267199,
+    "avg_tokens_per_sentence": 19.7,
+    "percentiles": {
+      "p50": 15,
+      "p90": 40,
+      "p95": 51,
+      "p99": 78
+    }
+  },
+  "100k": {
+    "vocab_size": 100000,
+    "coverage": 99.95,
+    "fertility": 1.48,
+    "unk_rate": 0.047,
+    "total_tokens": 1877137,
+    "total_words": 1267199,
+    "avg_tokens_per_sentence": 18.8,
+    "percentiles": {
+      "p50": 15,
+      "p90": 38,
+      "p95": 48,
+      "p99": 74
+    }
+  }
+}
