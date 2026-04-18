@@ -2,15 +2,17 @@ package main
 
 import (
 	"bufio"
+	"container/heap"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,7 +59,7 @@ type Stats struct {
 
 	// Новые метрики
 	AdjacentDuplicates      int64 // точные дубли подряд
-	RunningHeaderCandidates int64 // кандидаты в колонтитулы (будет заполнено после внешней сортировки)
+	RunningHeaderCandidates int64 // кандидаты в колонтитулы (будет заполнено после обработки)
 	BrokenSentences         int64 // разорванные предложения
 	IndexEntries            int64 // предметные указатели
 	HyphenatedWordsLeft     int64 // оставшиеся переносы слов
@@ -509,6 +511,191 @@ func analyzeFile(filePath string, stats *Stats, fileStatsChan chan<- FileStats, 
 	fileStatsChan <- localStats
 }
 
+// Обработка частых фраз чанками с внешней сортировкой слиянием
+func processFrequentPhrases(rawPath, outPath string, chunkSize int) error {
+	f, err := os.Open(rawPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	buf := make([]byte, 1024*1024)
+	scanner.Buffer(buf, 10*1024*1024)
+
+	var chunkFiles []string
+	var chunkIdx int
+	freqMap := make(map[string]int, chunkSize)
+
+	linesInChunk := 0
+	for scanner.Scan() {
+		phrase := scanner.Text()
+		freqMap[phrase]++
+		linesInChunk++
+
+		if linesInChunk >= chunkSize {
+			cf, err := saveChunk(freqMap, chunkIdx)
+			if err != nil {
+				return err
+			}
+			chunkFiles = append(chunkFiles, cf)
+			chunkIdx++
+			freqMap = make(map[string]int, chunkSize)
+			linesInChunk = 0
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	// Последний чанк
+	if len(freqMap) > 0 {
+		cf, err := saveChunk(freqMap, chunkIdx)
+		if err != nil {
+			return err
+		}
+		chunkFiles = append(chunkFiles, cf)
+	}
+
+	return mergeChunks(chunkFiles, outPath)
+}
+
+func saveChunk(freq map[string]int, idx int) (string, error) {
+	type entry struct {
+		phrase string
+		count  int
+	}
+	entries := make([]entry, 0, len(freq))
+	for p, c := range freq {
+		entries = append(entries, entry{p, c})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].count != entries[j].count {
+			return entries[i].count > entries[j].count
+		}
+		return entries[i].phrase < entries[j].phrase
+	})
+
+	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("freq_chunk_%06d.txt", idx))
+	f, err := os.Create(tmpFile)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	w := bufio.NewWriter(f)
+	for _, e := range entries {
+		fmt.Fprintf(w, "%d\t%s\n", e.count, e.phrase)
+	}
+	w.Flush()
+	return tmpFile, nil
+}
+
+// mergeChunks сливает отсортированные чанки с помощью кучи
+func mergeChunks(chunkFiles []string, outPath string) error {
+	if len(chunkFiles) == 0 {
+		return nil
+	}
+	// Открываем все чанки
+	readers := make([]*bufio.Scanner, len(chunkFiles))
+	files := make([]*os.File, len(chunkFiles))
+	for i, name := range chunkFiles {
+		f, err := os.Open(name)
+		if err != nil {
+			return err
+		}
+		files[i] = f
+		readers[i] = bufio.NewScanner(f)
+	}
+	defer func() {
+		for _, f := range files {
+			f.Close()
+		}
+		for _, name := range chunkFiles {
+			os.Remove(name)
+		}
+	}()
+
+	// Инициализируем кучу
+	type heapItem struct {
+		count  int
+		phrase string
+		idx    int // из какого чанка
+	}
+	h := &maxHeap{}
+	heap.Init(h)
+
+	for i, r := range readers {
+		if r.Scan() {
+			line := r.Text()
+			parts := strings.SplitN(line, "\t", 2)
+			if len(parts) == 2 {
+				count, _ := strconv.Atoi(parts[0])
+				heap.Push(h, heapItem{count, parts[1], i})
+			}
+		}
+	}
+
+	outF, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer outF.Close()
+	w := bufio.NewWriter(outF)
+	defer w.Flush()
+
+	// Записываем заголовок CSV
+	w.WriteString("phrase,count\n")
+
+	for h.Len() > 0 {
+		top := heap.Pop(h).(heapItem)
+		fmt.Fprintf(w, "%s,%d\n", top.phrase, top.count)
+
+		// Читаем следующую строку из того же чанка
+		r := readers[top.idx]
+		if r.Scan() {
+			line := r.Text()
+			parts := strings.SplitN(line, "\t", 2)
+			if len(parts) == 2 {
+				count, _ := strconv.Atoi(parts[0])
+				heap.Push(h, heapItem{count, parts[1], top.idx})
+			}
+		}
+	}
+	return nil
+}
+
+// maxHeap реализует кучу с максимальным элементом по count
+type maxHeap []struct {
+	count  int
+	phrase string
+	idx    int
+}
+
+func (h maxHeap) Len() int { return len(h) }
+func (h maxHeap) Less(i, j int) bool {
+	// Сортировка по убыванию count, при равном count - лексикографически
+	if h[i].count != h[j].count {
+		return h[i].count > h[j].count
+	}
+	return h[i].phrase < h[j].phrase
+}
+func (h maxHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *maxHeap) Push(x interface{}) {
+	*h = append(*h, x.(struct {
+		count  int
+		phrase string
+		idx    int
+	}))
+}
+
+func (h *maxHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
 func main() {
 	var (
 		sentencesDir = flag.String("dir", "", "директория с JSONL файлами")
@@ -542,6 +729,10 @@ func main() {
 	phraseWg.Add(1)
 	go func() {
 		defer phraseWg.Done()
+		if err := os.MkdirAll(*outputDir, 0755); err != nil {
+			log.Printf("ERROR creating output dir: %v", err)
+			return
+		}
 		rawPath := filepath.Join(*outputDir, "phrases_raw.txt")
 		f, err := os.Create(rawPath)
 		if err != nil {
@@ -631,36 +822,31 @@ func main() {
 	log.Printf("[PROGRESS] COMPLETE: %d/%d files processed in %v",
 		atomic.LoadInt64(&progress.processedFiles), progress.totalFiles, totalTime.Round(time.Second))
 
-	// Внешняя сортировка для частых фраз
+	// Обработка частых фраз
 	rawPhrasesPath := filepath.Join(*outputDir, "phrases_raw.txt")
 	frequentPath := filepath.Join(*outputDir, "frequent_phrases.csv")
-	log.Printf("Sorting and counting frequent phrases...")
-	// Используем sort | uniq -c | sort -nr
-	cmd := exec.Command("bash", "-c",
-		fmt.Sprintf("sort -S 4G '%s' | uniq -c | sort -nr > '%s'", rawPhrasesPath, frequentPath))
-	if err := cmd.Run(); err != nil {
-		log.Printf("ERROR during external sort: %v", err)
+	log.Printf("Processing frequent phrases in chunks (chunk size: 10M lines)...")
+	if err := processFrequentPhrases(rawPhrasesPath, frequentPath, 10_000_000); err != nil {
+		log.Printf("ERROR processing phrases: %v", err)
 	} else {
 		log.Printf("Saved frequent phrases to %s", frequentPath)
-		// Опционально удаляем сырой файл
-		os.Remove(rawPhrasesPath)
+		os.Remove(rawPhrasesPath) // удаляем сырой файл
 	}
 
 	// Подсчёт кандидатов в колонтитулы (фразы с частотой >10)
-	// Читаем первую колонку из frequent_phrases.csv
 	frequentFile, err := os.Open(frequentPath)
 	if err == nil {
 		defer frequentFile.Close()
 		scanner := bufio.NewScanner(frequentFile)
+		// Пропускаем заголовок
+		scanner.Scan()
 		var candidates int64
 		for scanner.Scan() {
 			line := scanner.Text()
-			// Формат: "  12345 phrase text"
-			line = strings.TrimSpace(line)
-			parts := strings.SplitN(line, " ", 2)
-			if len(parts) >= 1 {
-				var count int
-				fmt.Sscanf(parts[0], "%d", &count)
+			// Формат: phrase,count
+			parts := strings.SplitN(line, ",", 2)
+			if len(parts) == 2 {
+				count, _ := strconv.Atoi(parts[1])
 				if count > 10 {
 					candidates++
 				}
