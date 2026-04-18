@@ -16,16 +16,16 @@ import (
 	"unicode"
 )
 
-// Stats для очистки
+// CleanStats хранит статистику очистки
 type CleanStats struct {
-	Processed            int64
-	Kept                 int64
-	Removed              int64
-	AdjacentDupesRemoved int64
-	IndexRemoved         int64
-	URLRemoved           int64
-	GarbageShortRemoved  int64
-	HighDigitRemoved     int64
+	Processed             int64
+	Kept                  int64
+	Removed               int64
+	EmptyRemoved          int64
+	AdjacentDupesRemoved  int64
+	IndexRemoved          int64
+	GarbagePatternRemoved int64
+	HighDigitRemoved      int64
 }
 
 var (
@@ -66,40 +66,13 @@ func isIndexEntry(text string) bool {
 	return float64(matches)/float64(nonEmpty) > 0.7
 }
 
-// isGarbageShort проверяет короткий мусор
-func isGarbageShort(text string) bool {
-	text = strings.TrimSpace(text)
-	runes := []rune(text)
-
-	// Слишком короткое
-	if len(runes) < 3 {
-		letters := 0
-		for _, r := range runes {
-			if unicode.IsLetter(r) {
-				letters++
-			}
-		}
-		// Если нет букв или только одна буква — мусор
-		if letters == 0 {
-			return true
-		}
-		if letters == 1 && len(runes) <= 2 {
-			return true
-		}
-	}
-
-	// Только цифры и пунктуация
-	letters := 0
-	for _, r := range runes {
-		if unicode.IsLetter(r) {
-			letters++
-		}
-	}
-	if letters == 0 && len(runes) < 20 {
-		return true
-	}
-
-	return false
+// hasGarbagePatterns проверяет наличие мусорных паттернов
+func hasGarbagePatterns(text string) bool {
+	return urlRegex.MatchString(text) ||
+		isbnRegex.MatchString(text) ||
+		udkRegex.MatchString(text) ||
+		bbkRegex.MatchString(text) ||
+		emailRegex.MatchString(text)
 }
 
 // digitRatio возвращает долю цифр в тексте
@@ -132,56 +105,8 @@ func letterRatio(text string) float64 {
 	return float64(letters) / float64(len(runes))
 }
 
-// hasGarbagePatterns проверяет наличие мусорных паттернов
-func hasGarbagePatterns(text string) bool {
-	return urlRegex.MatchString(text) ||
-		isbnRegex.MatchString(text) ||
-		udkRegex.MatchString(text) ||
-		bbkRegex.MatchString(text) ||
-		emailRegex.MatchString(text)
-}
-
-// normalizeListMarkers нормализует маркеры списков
-func normalizeListMarkers(text string) string {
-	// Заменяем маркеры вида "1. ", "1) " на "• "
-	listMarkerRegex := regexp.MustCompile(`^[\d]+[\.\)]\s+`)
-	if listMarkerRegex.MatchString(text) {
-		text = listMarkerRegex.ReplaceAllString(text, "• ")
-	}
-
-	// Заменяем дефисы в начале строки на •
-	dashMarkerRegex := regexp.MustCompile(`^[-–—]\s+`)
-	if dashMarkerRegex.MatchString(text) {
-		text = dashMarkerRegex.ReplaceAllString(text, "• ")
-	}
-
-	return text
-}
-
-// normalizePunctuation нормализует кавычки и тире
-func normalizePunctuation(text string) string {
-	// Кавычки
-	text = strings.ReplaceAll(text, "«", "\"")
-	text = strings.ReplaceAll(text, "»", "\"")
-	text = strings.ReplaceAll(text, "„", "\"")
-	text = strings.ReplaceAll(text, "“", "\"")
-	text = strings.ReplaceAll(text, "”", "\"")
-	text = strings.ReplaceAll(text, "'", "'")
-	text = strings.ReplaceAll(text, "'", "'")
-
-	// Тире и дефисы
-	text = strings.ReplaceAll(text, "—", "-")
-	text = strings.ReplaceAll(text, "–", "-")
-	text = strings.ReplaceAll(text, "−", "-")
-
-	// Многоточие
-	text = regexp.MustCompile(`\.{3,}`).ReplaceAllString(text, "...")
-	text = strings.ReplaceAll(text, "…", "...")
-
-	return text
-}
-
 // cleanSentence очищает одно предложение
+// Возвращает: очищенный текст, флаг "оставить", причина удаления
 func cleanSentence(text string) (string, bool, string) {
 	text = strings.TrimSpace(text)
 
@@ -190,7 +115,7 @@ func cleanSentence(text string) (string, bool, string) {
 		return "", false, "empty"
 	}
 
-	// 2. Мусорные паттерны (URL, ISBN, etc)
+	// 2. Мусорные паттерны (URL, ISBN, email)
 	if hasGarbagePatterns(text) {
 		return "", false, "garbage_pattern"
 	}
@@ -200,26 +125,18 @@ func cleanSentence(text string) (string, bool, string) {
 		return "", false, "index"
 	}
 
-	// 4. Короткий мусор
-	if isGarbageShort(text) {
-		return "", false, "short_garbage"
-	}
-
-	// 5. Много цифр + мало букв
-	dr := digitRatio(text)
+	// 4. Только цифры и пунктуация (нет букв)
 	lr := letterRatio(text)
-	if dr > 0.5 && lr < 0.3 {
-		return "", false, "high_digit"
+	if lr < 0.1 {
+		dr := digitRatio(text)
+		if dr > 0.5 {
+			return "", false, "high_digit_no_letters"
+		}
 	}
 
-	// 6. Нормализация пунктуации
-	text = normalizePunctuation(text)
-
-	// 7. Нормализация маркеров списков
-	text = normalizeListMarkers(text)
-
-	// 8. Убираем множественные пробелы
-	text = regexp.MustCompile(`\s+`).ReplaceAllString(text, " ")
+	// 5. Убираем множественные пробелы (но сохраняем \n внутри!)
+	// Не трогаем \n, так как они могут быть частью структуры (списки)
+	text = regexp.MustCompile(`[ \t]+`).ReplaceAllString(text, " ")
 
 	return text, true, ""
 }
@@ -233,7 +150,9 @@ func processFile(inputPath, outputPath string, stats *CleanStats) error {
 	defer inputFile.Close()
 
 	// Создаем выходную директорию если нужно
-	os.MkdirAll(filepath.Dir(outputPath), 0755)
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
+		return err
+	}
 
 	outputFile, err := os.Create(outputPath)
 	if err != nil {
@@ -266,13 +185,13 @@ func processFile(inputPath, outputPath string, stats *CleanStats) error {
 		if !keep {
 			atomic.AddInt64(&stats.Removed, 1)
 			switch reason {
+			case "empty":
+				atomic.AddInt64(&stats.EmptyRemoved, 1)
+			case "garbage_pattern":
+				atomic.AddInt64(&stats.GarbagePatternRemoved, 1)
 			case "index":
 				atomic.AddInt64(&stats.IndexRemoved, 1)
-			case "garbage_pattern":
-				atomic.AddInt64(&stats.URLRemoved, 1)
-			case "short_garbage":
-				atomic.AddInt64(&stats.GarbageShortRemoved, 1)
-			case "high_digit":
+			case "high_digit_no_letters":
 				atomic.AddInt64(&stats.HighDigitRemoved, 1)
 			}
 			continue
@@ -290,7 +209,7 @@ func processFile(inputPath, outputPath string, stats *CleanStats) error {
 		localKept++
 	}
 
-	// Перезаписываем position
+	// Перезаписываем position (сохраняем порядок)
 	for i, sent := range sentences {
 		sent["position"] = i
 		data, err := json.Marshal(sent)
@@ -332,6 +251,10 @@ func main() {
 		log.Fatalf("glob: %v", err)
 	}
 	log.Printf("Found %d files", len(files))
+
+	if len(files) == 0 {
+		log.Fatal("No JSONL files found")
+	}
 
 	stats := &CleanStats{}
 	progress := &Progress{
@@ -391,24 +314,24 @@ func main() {
 
 	// Сохраняем статистику очистки
 	summary := map[string]interface{}{
-		"total_files":            len(files),
-		"processed":              stats.Processed,
-		"total_kept":             stats.Kept,
-		"total_removed":          stats.Removed,
-		"adjacent_dupes_removed": stats.AdjacentDupesRemoved,
-		"index_removed":          stats.IndexRemoved,
-		"url_removed":            stats.URLRemoved,
-		"garbage_short_removed":  stats.GarbageShortRemoved,
-		"high_digit_removed":     stats.HighDigitRemoved,
-		"removed_percent":        float64(stats.Removed) / float64(stats.Removed+stats.Kept) * 100,
-		"cleaning_time_seconds":  totalTime.Seconds(),
+		"total_files":             len(files),
+		"processed":               stats.Processed,
+		"total_kept":              stats.Kept,
+		"total_removed":           stats.Removed,
+		"empty_removed":           stats.EmptyRemoved,
+		"adjacent_dupes_removed":  stats.AdjacentDupesRemoved,
+		"index_removed":           stats.IndexRemoved,
+		"garbage_pattern_removed": stats.GarbagePatternRemoved,
+		"high_digit_removed":      stats.HighDigitRemoved,
+		"removed_percent":         float64(stats.Removed) / float64(stats.Removed+stats.Kept) * 100,
+		"cleaning_time_seconds":   totalTime.Seconds(),
 	}
 
 	summaryPath := filepath.Join(*outputDir, "cleaning_summary.json")
 	summaryData, _ := json.MarshalIndent(summary, "", "  ")
 	os.WriteFile(summaryPath, summaryData, 0644)
 
-	// Вывод
+	// Вывод в консоль
 	fmt.Println("\n" + strings.Repeat("=", 60))
 	fmt.Println("JSONL CLEANING COMPLETE")
 	fmt.Println(strings.Repeat("=", 60))
@@ -416,10 +339,10 @@ func main() {
 	fmt.Printf("Total kept:       %d\n", stats.Kept)
 	fmt.Printf("Total removed:    %d (%.2f%%)\n", stats.Removed, float64(stats.Removed)/float64(stats.Removed+stats.Kept)*100)
 	fmt.Println(strings.Repeat("-", 60))
+	fmt.Printf("Empty:            %d\n", stats.EmptyRemoved)
 	fmt.Printf("Adjacent dupes:   %d\n", stats.AdjacentDupesRemoved)
 	fmt.Printf("Index entries:    %d\n", stats.IndexRemoved)
-	fmt.Printf("URL/ISBN/etc:     %d\n", stats.URLRemoved)
-	fmt.Printf("Short garbage:    %d\n", stats.GarbageShortRemoved)
+	fmt.Printf("Garbage patterns: %d\n", stats.GarbagePatternRemoved)
 	fmt.Printf("High digit:       %d\n", stats.HighDigitRemoved)
 	fmt.Printf("Time:             %v\n", totalTime.Round(time.Second))
 	fmt.Println(strings.Repeat("=", 60))
