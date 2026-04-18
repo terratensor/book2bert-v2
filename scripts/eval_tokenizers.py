@@ -71,7 +71,7 @@ def main():
     models = {
         "32k": f"{models_dir}/sp_32k.model",
         "64k": f"{models_dir}/sp_64k.model",
-        "100k": f"{models_dir}/sp_100k.model",
+        "100k": f"{models_dir}/final/sp_100k.model",
     }
     
     results = {}

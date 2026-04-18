@@ -33,15 +33,15 @@
     "vocab_size": 100000,
     "coverage": 99.95,
     "fertility": 1.48,
-    "unk_rate": 0.047,
-    "total_tokens": 1877137,
+    "unk_rate": 0.0458,
+    "total_tokens": 1877057,
     "total_words": 1267199,
     "avg_tokens_per_sentence": 18.8,
     "percentiles": {
       "p50": 15,
       "p90": 38,
       "p95": 48,
-      "p99": 74
+      "p99": 75
     }
   }
 }

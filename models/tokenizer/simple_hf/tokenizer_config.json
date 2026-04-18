@@ -1,0 +1,11 @@
+{
+  "model_max_length": 512,
+  "do_lower_case": false,
+  "unk_token": "[UNK]",
+  "pad_token": "[PAD]",
+  "cls_token": "[CLS]",
+  "sep_token": "[SEP]",
+  "mask_token": "[MASK]",
+  "vocab_size": 100000,
+  "tokenizer_class": "SimpleSPTokenizer"
+}
