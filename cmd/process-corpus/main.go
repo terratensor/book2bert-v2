@@ -182,7 +182,7 @@ func processFile(ctx context.Context, task FileTask, seg segmenter.Segmenter, re
 	}
 
 	// 7. Удаление остальных не-русских символов (латиница остаётся, но другие алфавиты — нет)
-	text = textutils.FilterNonRussian(text)
+	// text = textutils.FilterNonRussian(text)
 
 	// 8. Проверка на пустоту
 	if len(strings.TrimSpace(text)) == 0 {
