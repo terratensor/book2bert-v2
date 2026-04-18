@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,8 +26,9 @@ type Stats struct {
 	TotalFiles     int64
 	EmptySentences int64
 
-	// Распределение длины
-	Lengths []int64
+	// Гистограмма длин (1001 бакетов: 0-10,10-20,...,9990-10000, >10000)
+	lengthBuckets [1001]int64
+	totalLengths  int64 // общее количество предложений для перцентилей
 
 	// Языковой состав
 	RussianOnly        int64
@@ -56,20 +57,12 @@ type Stats struct {
 
 	// Новые метрики
 	AdjacentDuplicates      int64 // точные дубли подряд
-	RunningHeaderCandidates int64 // кандидаты в колонтитулы
+	RunningHeaderCandidates int64 // кандидаты в колонтитулы (будет заполнено после внешней сортировки)
 	BrokenSentences         int64 // разорванные предложения
 	IndexEntries            int64 // предметные указатели
 	HyphenatedWordsLeft     int64 // оставшиеся переносы слов
 	GreekLettersCount       int64 // количество греческих символов
 	MathSymbolsCount        int64 // количество математических символов
-
-	// Для анализа колонтитулов
-	FrequentPhrases map[string]int
-	FrequentMu      sync.Mutex
-
-	// Дубликаты
-	uniqueMap map[[16]byte]bool
-	mu        sync.Mutex
 }
 
 // FileStats хранит статистику по одному файлу
@@ -271,7 +264,32 @@ func countMathSymbols(text string) int {
 	return count
 }
 
-func analyzeFile(filePath string, stats *Stats, fileStatsChan chan<- FileStats, wg *sync.WaitGroup, sem chan struct{}, progress *Progress) {
+// addLength добавляет длину в гистограмму (потокобезопасно)
+func (s *Stats) addLength(l int64) {
+	idx := l / 10
+	if idx > 1000 {
+		idx = 1000
+	}
+	atomic.AddInt64(&s.lengthBuckets[idx], 1)
+	atomic.AddInt64(&s.totalLengths, 1)
+}
+
+// percentile вычисляет p-й перцентиль (p от 0 до 100) по гистограмме
+func (s *Stats) percentile(p float64) int64 {
+	target := int64(float64(s.totalLengths) * p / 100)
+	var cum int64
+	for i, count := range s.lengthBuckets {
+		cum += count
+		if cum >= target {
+			// Возвращаем середину бина
+			return int64(i)*10 + 5
+		}
+	}
+	return 10005 // если не нашли (например, для p=100)
+}
+
+// analyzeFile обрабатывает один JSONL файл
+func analyzeFile(filePath string, stats *Stats, fileStatsChan chan<- FileStats, wg *sync.WaitGroup, sem chan struct{}, progress *Progress, phraseChan chan<- string) {
 	defer wg.Done()
 	sem <- struct{}{}
 	defer func() { <-sem }()
@@ -288,7 +306,7 @@ func analyzeFile(filePath string, stats *Stats, fileStatsChan chan<- FileStats, 
 	buf := make([]byte, 1024*1024)
 	scanner.Buffer(buf, 10*1024*1024)
 
-	var localLengths []int64
+	var localLengths []int64 // для локального вычисления AvgLength
 	var localStats FileStats
 	localStats.Path = filePath
 	localStats.Examples = make([]string, 0, 10)
@@ -323,6 +341,9 @@ func analyzeFile(filePath string, stats *Stats, fileStatsChan chan<- FileStats, 
 		length := int64(len([]rune(text)))
 		atomic.AddInt64(&stats.TotalChars, length)
 		localLengths = append(localLengths, length)
+
+		// Добавляем длину в гистограмму
+		stats.addLength(length)
 
 		// Языковой состав
 		hasRu := isRussian(text)
@@ -458,26 +479,26 @@ func analyzeFile(filePath string, stats *Stats, fileStatsChan chan<- FileStats, 
 			atomic.AddInt64(&stats.MathSymbolsCount, int64(math))
 		}
 
-		// Сбор частых фраз для поиска колонтитулов
-		if len([]rune(text)) > 10 && len([]rune(text)) < 100 {
-			stats.FrequentMu.Lock()
-			if stats.FrequentPhrases == nil {
-				stats.FrequentPhrases = make(map[string]int)
+		// Сбор фраз для анализа колонтитулов (отправляем в канал)
+		if length > 10 && length < 100 {
+			select {
+			case phraseChan <- text:
+			default:
+				// если канал переполнен, пропускаем (маловероятно)
 			}
-			stats.FrequentPhrases[text]++
-			stats.FrequentMu.Unlock()
 		}
 
 		prevText = text
 		prevPosition = position
 	}
 
-	stats.mu.Lock()
-	stats.Lengths = append(stats.Lengths, localLengths...)
-	stats.mu.Unlock()
-
+	// Вычисляем среднюю длину для файла
 	if localStats.Sentences > 0 {
-		localStats.AvgLength = float64(localLengths[0]) // временно, потом пересчитаем
+		var sum int64
+		for _, l := range localLengths {
+			sum += l
+		}
+		localStats.AvgLength = float64(sum) / float64(localStats.Sentences)
 		localStats.RussianRatio /= float64(localStats.Sentences)
 		localStats.EnglishRatio /= float64(localStats.Sentences)
 		localStats.MixedRatio /= float64(localStats.Sentences)
@@ -486,20 +507,6 @@ func analyzeFile(filePath string, stats *Stats, fileStatsChan chan<- FileStats, 
 		localStats.GarbageRatio /= float64(localStats.Sentences)
 	}
 	fileStatsChan <- localStats
-}
-
-func analyzeRunningHeaders(stats *Stats) int64 {
-	stats.FrequentMu.Lock()
-	defer stats.FrequentMu.Unlock()
-
-	var candidates int64
-	for _, count := range stats.FrequentPhrases {
-		if count > 10 {
-			candidates++
-		}
-	}
-	stats.RunningHeaderCandidates = candidates
-	return candidates
 }
 
 func main() {
@@ -520,18 +527,38 @@ func main() {
 	}
 	log.Printf("Found %d files", len(files))
 
-	stats := &Stats{
-		Lengths:         make([]int64, 0),
-		uniqueMap:       make(map[[16]byte]bool),
-		FrequentPhrases: make(map[string]int),
-	}
+	stats := &Stats{}
 
 	progress := &Progress{
 		totalFiles: int64(len(files)),
 		startTime:  time.Now(),
 	}
 
-	fileStatsChan := make(chan FileStats, len(files))
+	// Канал для фраз (колонтитулы) с буфером
+	phraseChan := make(chan string, 10000)
+
+	// Горутина-писатель для сырых фраз
+	var phraseWg sync.WaitGroup
+	phraseWg.Add(1)
+	go func() {
+		defer phraseWg.Done()
+		rawPath := filepath.Join(*outputDir, "phrases_raw.txt")
+		f, err := os.Create(rawPath)
+		if err != nil {
+			log.Printf("ERROR creating phrases_raw.txt: %v", err)
+			return
+		}
+		defer f.Close()
+		w := bufio.NewWriter(f)
+		defer w.Flush()
+		for phrase := range phraseChan {
+			w.WriteString(phrase)
+			w.WriteByte('\n')
+		}
+	}()
+
+	// Канал для пофайловой статистики (буфер 5000)
+	fileStatsChan := make(chan FileStats, 5000)
 	sem := make(chan struct{}, *workers)
 	var wg sync.WaitGroup
 
@@ -552,45 +579,116 @@ func main() {
 		}
 	}()
 
+	// Запуск воркеров
 	for _, f := range files {
 		wg.Add(1)
-		go analyzeFile(f, stats, fileStatsChan, &wg, sem, progress)
+		go analyzeFile(f, stats, fileStatsChan, &wg, sem, progress, phraseChan)
 	}
 
+	// Горутина для закрытия каналов после завершения обработки файлов
 	go func() {
 		wg.Wait()
 		close(fileStatsChan)
+		close(phraseChan)
 	}()
 
-	var fileStatsList []FileStats
-	for fs := range fileStatsChan {
-		fileStatsList = append(fileStatsList, fs)
+	// Создаём директорию для выходных файлов
+	if err := os.MkdirAll(*outputDir, 0755); err != nil {
+		log.Fatalf("Cannot create output dir: %v", err)
 	}
 
-	// Анализ колонтитулов
-	analyzeRunningHeaders(stats)
+	// Потоковая запись пофайловой статистики
+	fileStatsPath := filepath.Join(*outputDir, "stats_per_file.csv")
+	fileStatsFile, err := os.Create(fileStatsPath)
+	if err != nil {
+		log.Fatalf("Cannot create stats_per_file.csv: %v", err)
+	}
+	defer fileStatsFile.Close()
+	fsWriter := csv.NewWriter(fileStatsFile)
+	fsWriter.Write([]string{"file", "sentences", "russian_ratio", "english_ratio", "mixed_ratio", "digit_ratio_30", "list_ratio", "garbage_ratio", "examples"})
+
+	for fs := range fileStatsChan {
+		examplesStr := strings.Join(fs.Examples, " | ")
+		fsWriter.Write([]string{
+			filepath.Base(fs.Path),
+			fmt.Sprintf("%d", fs.Sentences),
+			fmt.Sprintf("%.4f", fs.RussianRatio),
+			fmt.Sprintf("%.4f", fs.EnglishRatio),
+			fmt.Sprintf("%.4f", fs.MixedRatio),
+			fmt.Sprintf("%.4f", fs.DigitRatio30),
+			fmt.Sprintf("%.4f", fs.ListRatio),
+			fmt.Sprintf("%.4f", fs.GarbageRatio),
+			examplesStr,
+		})
+	}
+	fsWriter.Flush()
+	log.Printf("Saved per-file stats to %s", fileStatsPath)
+
+	// Ждём завершения записи сырых фраз
+	phraseWg.Wait()
 
 	totalTime := time.Since(progress.startTime)
 	log.Printf("[PROGRESS] COMPLETE: %d/%d files processed in %v",
 		atomic.LoadInt64(&progress.processedFiles), progress.totalFiles, totalTime.Round(time.Second))
 
-	// Сортируем длины для перцентилей
-	sort.Slice(stats.Lengths, func(i, j int) bool {
-		return stats.Lengths[i] < stats.Lengths[j]
-	})
+	// Внешняя сортировка для частых фраз
+	rawPhrasesPath := filepath.Join(*outputDir, "phrases_raw.txt")
+	frequentPath := filepath.Join(*outputDir, "frequent_phrases.csv")
+	log.Printf("Sorting and counting frequent phrases...")
+	// Используем sort | uniq -c | sort -nr
+	cmd := exec.Command("bash", "-c",
+		fmt.Sprintf("sort -S 4G '%s' | uniq -c | sort -nr > '%s'", rawPhrasesPath, frequentPath))
+	if err := cmd.Run(); err != nil {
+		log.Printf("ERROR during external sort: %v", err)
+	} else {
+		log.Printf("Saved frequent phrases to %s", frequentPath)
+		// Опционально удаляем сырой файл
+		os.Remove(rawPhrasesPath)
+	}
 
-	// Вычисляем перцентили
+	// Подсчёт кандидатов в колонтитулы (фразы с частотой >10)
+	// Читаем первую колонку из frequent_phrases.csv
+	frequentFile, err := os.Open(frequentPath)
+	if err == nil {
+		defer frequentFile.Close()
+		scanner := bufio.NewScanner(frequentFile)
+		var candidates int64
+		for scanner.Scan() {
+			line := scanner.Text()
+			// Формат: "  12345 phrase text"
+			line = strings.TrimSpace(line)
+			parts := strings.SplitN(line, " ", 2)
+			if len(parts) >= 1 {
+				var count int
+				fmt.Sscanf(parts[0], "%d", &count)
+				if count > 10 {
+					candidates++
+				}
+			}
+		}
+		stats.RunningHeaderCandidates = candidates
+	}
+
+	// Вычисляем перцентили по гистограмме
 	percentiles := []float64{1, 5, 10, 25, 50, 75, 90, 95, 99}
 	percentileValues := make(map[string]int64)
 	for _, p := range percentiles {
-		idx := int(float64(len(stats.Lengths)) * p / 100)
-		if idx >= len(stats.Lengths) {
-			idx = len(stats.Lengths) - 1
+		percentileValues[fmt.Sprintf("%.0f", p)] = stats.percentile(p)
+	}
+
+	// Минимальная и максимальная длина (приблизительно по гистограмме)
+	var minLength, maxLength int64
+	for i, count := range stats.lengthBuckets {
+		if count > 0 {
+			minLength = int64(i) * 10
+			break
 		}
-		if idx < 0 {
-			idx = 0
+	}
+	for i := len(stats.lengthBuckets) - 1; i >= 0; i-- {
+		if stats.lengthBuckets[i] > 0 {
+			maxLength = int64(i)*10 + 10
+			break
 		}
-		percentileValues[fmt.Sprintf("%.0f", p)] = stats.Lengths[idx]
 	}
 
 	// Сохраняем общую статистику в JSON
@@ -599,8 +697,8 @@ func main() {
 		"total_chars":               stats.TotalChars,
 		"total_files":               len(files),
 		"empty_sentences":           stats.EmptySentences,
-		"min_length":                stats.Lengths[0],
-		"max_length":                stats.Lengths[len(stats.Lengths)-1],
+		"min_length":                minLength,
+		"max_length":                maxLength,
 		"avg_length":                float64(stats.TotalChars) / float64(stats.TotalSentences),
 		"percentiles":               percentileValues,
 		"russian_only":              stats.RussianOnly,
@@ -634,8 +732,6 @@ func main() {
 		"analysis_time_seconds":     totalTime.Seconds(),
 	}
 
-	os.MkdirAll(*outputDir, 0755)
-
 	jsonPath := filepath.Join(*outputDir, "stats_summary.json")
 	jsonData, err := json.MarshalIndent(summary, "", "  ")
 	if err != nil {
@@ -648,77 +744,29 @@ func main() {
 		}
 	}
 
-	// Сохраняем гистограмму
+	// Сохраняем гистограмму длин
 	histPath := filepath.Join(*outputDir, "stats_length_histogram.csv")
-	histFile, _ := os.Create(histPath)
-	defer histFile.Close()
-	histWriter := csv.NewWriter(histFile)
-	histWriter.Write([]string{"bucket", "count"})
-	bucketSize := int64(100)
-	buckets := make(map[int64]int64)
-	for _, l := range stats.Lengths {
-		bucket := l / bucketSize * bucketSize
-		buckets[bucket]++
-	}
-	for b, c := range buckets {
-		histWriter.Write([]string{fmt.Sprintf("%d-%d", b, b+bucketSize), fmt.Sprintf("%d", c)})
-	}
-	histWriter.Flush()
-	log.Printf("Saved histogram to %s", histPath)
-
-	// Сохраняем пофайловую статистику
-	fileStatsPath := filepath.Join(*outputDir, "stats_per_file.csv")
-	fileStatsFile, _ := os.Create(fileStatsPath)
-	defer fileStatsFile.Close()
-	fsWriter := csv.NewWriter(fileStatsFile)
-	fsWriter.Write([]string{"file", "sentences", "russian_ratio", "english_ratio", "mixed_ratio", "digit_ratio_30", "list_ratio", "garbage_ratio", "examples"})
-	for _, fs := range fileStatsList {
-		examplesStr := strings.Join(fs.Examples, " | ")
-		fsWriter.Write([]string{
-			filepath.Base(fs.Path),
-			fmt.Sprintf("%d", fs.Sentences),
-			fmt.Sprintf("%.4f", fs.RussianRatio),
-			fmt.Sprintf("%.4f", fs.EnglishRatio),
-			fmt.Sprintf("%.4f", fs.MixedRatio),
-			fmt.Sprintf("%.4f", fs.DigitRatio30),
-			fmt.Sprintf("%.4f", fs.ListRatio),
-			fmt.Sprintf("%.4f", fs.GarbageRatio),
-			examplesStr,
-		})
-	}
-	fsWriter.Flush()
-	log.Printf("Saved per-file stats to %s", fileStatsPath)
-
-	// Сохраняем частые фразы (кандидаты в колонтитулы)
-	frequentPath := filepath.Join(*outputDir, "frequent_phrases.csv")
-	frequentFile, _ := os.Create(frequentPath)
-	defer frequentFile.Close()
-	freqWriter := csv.NewWriter(frequentFile)
-	freqWriter.Write([]string{"phrase", "count"})
-
-	// Сортируем по убыванию частоты
-	type phraseCount struct {
-		phrase string
-		count  int
-	}
-	var phrases []phraseCount
-	stats.FrequentMu.Lock()
-	for p, c := range stats.FrequentPhrases {
-		if c >= 5 {
-			phrases = append(phrases, phraseCount{p, c})
+	histFile, err := os.Create(histPath)
+	if err != nil {
+		log.Printf("ERROR creating histogram file: %v", err)
+	} else {
+		defer histFile.Close()
+		histWriter := csv.NewWriter(histFile)
+		histWriter.Write([]string{"bucket", "count"})
+		for i, count := range stats.lengthBuckets {
+			if count > 0 {
+				start := int64(i) * 10
+				end := start + 10
+				if i == 1000 {
+					histWriter.Write([]string{fmt.Sprintf(">%d", start), fmt.Sprintf("%d", count)})
+				} else {
+					histWriter.Write([]string{fmt.Sprintf("%d-%d", start, end), fmt.Sprintf("%d", count)})
+				}
+			}
 		}
+		histWriter.Flush()
+		log.Printf("Saved histogram to %s", histPath)
 	}
-	stats.FrequentMu.Unlock()
-
-	sort.Slice(phrases, func(i, j int) bool {
-		return phrases[i].count > phrases[j].count
-	})
-
-	for _, pc := range phrases {
-		freqWriter.Write([]string{pc.phrase, fmt.Sprintf("%d", pc.count)})
-	}
-	freqWriter.Flush()
-	log.Printf("Saved frequent phrases to %s", frequentPath)
 
 	// Вывод в консоль
 	fmt.Println("\n" + strings.Repeat("=", 60))
@@ -728,8 +776,8 @@ func main() {
 	fmt.Printf("Total sentences:  %d\n", stats.TotalSentences)
 	fmt.Printf("Total chars:      %d\n", stats.TotalChars)
 	fmt.Printf("Average length:   %.2f chars\n", float64(stats.TotalChars)/float64(stats.TotalSentences))
-	fmt.Printf("Min length:       %d\n", stats.Lengths[0])
-	fmt.Printf("Max length:       %d\n", stats.Lengths[len(stats.Lengths)-1])
+	fmt.Printf("Min length:       %d\n", minLength)
+	fmt.Printf("Max length:       %d\n", maxLength)
 	fmt.Printf("Time:             %v\n", totalTime.Round(time.Second))
 	fmt.Println(strings.Repeat("-", 60))
 	fmt.Printf("Russian only:     %d (%.2f%%)\n", stats.RussianOnly, float64(stats.RussianOnly)/float64(stats.TotalSentences)*100)
