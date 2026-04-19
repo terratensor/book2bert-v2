@@ -188,9 +188,6 @@ def train_phase(
         # Куда сохранять чекпоинты и логи
         output_dir=output_dir,
         
-        # НЕ перезаписывать существующие файлы (важно для восстановления!)
-        overwrite_output_dir=False,
-        
         # Восстановление с чекпоинта (если нашли — продолжит, если нет — начнёт с нуля)
         resume_from_checkpoint=resume_from_checkpoint,
         
@@ -202,40 +199,39 @@ def train_phase(
         per_device_eval_batch_size=batch_size,
         
         # Накапливаем градиенты несколько шагов перед обновлением весов
-        # Это позволяет эмулировать больший batch size без OOM
         gradient_accumulation_steps=gradient_accumulation,
         
         # Как часто сохранять чекпоинты (в шагах)
+        save_strategy="steps",
         save_steps=save_steps,
-        save_total_limit=5,      # хранить только 5 последних чекпоинтов (экономия места)
+        save_total_limit=5,      # хранить только 5 последних чекпоинтов
         
         # Как часто выводить логи в консоль и TensorBoard
+        logging_strategy="steps",
         logging_steps=100,
-        logging_first_step=True,  # показать loss после первого шага
+        logging_first_step=True,
         
-        # Валидация — как часто проверять качество на val-датасете
-        evaluation_strategy="steps",
-        eval_steps=save_steps,    # валидируем с той же частотой, что и сохраняем
+        # Валидация
+        eval_strategy="steps",
+        eval_steps=save_steps,
         
         # Оптимизатор и learning rate
         learning_rate=learning_rate,
-        warmup_steps=int(max_steps * 0.01),  # 1% шагов на постепенное увеличение LR
-        weight_decay=0.01,                   # L2 регуляризация (предотвращает переобучение)
+        warmup_steps=int(max_steps * 0.01),
+        weight_decay=0.01,
         
-        # Смешанная точность (FP16) — экономит видеопамять и ускоряет обучение
-        # Веса хранятся в FP32, но вычисления в FP16
+        # Смешанная точность (FP16)
         fp16=True,
         
         # Количество процессов для загрузки данных
         dataloader_num_workers=4,
         
-        # Куда отправлять логи (TensorBoard)
+        # Куда отправлять логи
         report_to="tensorboard",
         
-        # Настройки для распределённого обучения на нескольких GPU (DDP)
-        ddp_find_unused_parameters=False,  # ускоряет DDP
-        local_rank=int(os.environ.get("LOCAL_RANK", -1)),  # ранг процесса при torchrun
-        ddp_backend="nccl",                # бэкенд для коммуникации между GPU (NVIDIA Collective Communications Library)
+        # Настройки для распределённого обучения
+        ddp_find_unused_parameters=False,
+        ddp_backend="nccl",
     )
     
     # ========================================================================
