@@ -11,7 +11,9 @@ import os
 import sys
 
 # Добавляем путь к модели
-MODEL_PATH = os.environ.get("SP_MODEL_PATH", "models/tokenizer/final/sp_100k.model")
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DEFAULT_MODEL = os.path.join(BASE_DIR, "models", "tokenizer", "final", "sp_100k.model")
+MODEL_PATH = os.environ.get("SP_MODEL_PATH", DEFAULT_MODEL)
 
 # Настройка логирования
 logging.basicConfig(

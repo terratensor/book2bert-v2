@@ -2,16 +2,16 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,178 +22,138 @@ type Sentence struct {
 	Text string `json:"text"`
 }
 
-// TokenizerClient — один Python-процесс, который стримит токенизацию
-type TokenizerClient struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout *bufio.Scanner
-	mu     sync.Mutex
-	clsID  int
-	sepID  int
-	padID  int
+// HTTPTokenizer — клиент к HTTP-сервису токенизации
+type HTTPTokenizer struct {
+	baseURL string
+	client  *http.Client
+	clsID   int
+	sepID   int
+	padID   int
 }
 
-func NewTokenizerClient(modelPath string) (*TokenizerClient, error) {
-	// Python скрипт, который читает строки и пишет токены
-	pythonScript := `
-import sys
-import sentencepiece as spm
-
-sp = spm.SentencePieceProcessor()
-sp.Load(sys.argv[1])
-
-# Читаем специальные токены
-cls_id = sp.PieceToId("[CLS]")
-sep_id = sp.PieceToId("[SEP]")
-pad_id = sp.PieceToId("[PAD]")
-
-# Первая строка — специальные токены
-print(f"{cls_id},{sep_id},{pad_id}")
-sys.stdout.flush()
-
-# Дальше обрабатываем строки
-for line in sys.stdin:
-    text = line.strip()
-    if not text:
-        print("")
-        sys.stdout.flush()
-        continue
-    ids = sp.EncodeAsIds(text)
-    print(",".join(map(str, ids)))
-    sys.stdout.flush()
-`
-
-	cmd := exec.Command("python3", "-c", pythonScript, modelPath)
-
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, err
+func NewHTTPTokenizer(baseURL string) (*HTTPTokenizer, error) {
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConnsPerHost: 100,
+			MaxIdleConns:        100,
+		},
 	}
 
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
+	t := &HTTPTokenizer{
+		baseURL: baseURL,
+		client:  client,
 	}
 
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-
-	scanner := bufio.NewScanner(stdout)
-
-	// Читаем первую строку — специальные токены
-	if !scanner.Scan() {
-		return nil, fmt.Errorf("failed to read special tokens")
-	}
-
-	parts := strings.Split(scanner.Text(), ",")
-	if len(parts) != 3 {
-		return nil, fmt.Errorf("invalid special tokens: %s", scanner.Text())
-	}
-
-	clsID, _ := strconv.Atoi(parts[0])
-	sepID, _ := strconv.Atoi(parts[1])
-	padID, _ := strconv.Atoi(parts[2])
-
-	log.Printf("Tokenizer ready: [CLS]=%d, [SEP]=%d, [PAD]=%d", clsID, sepID, padID)
-
-	return &TokenizerClient{
-		cmd:    cmd,
-		stdin:  stdin,
-		stdout: scanner,
-		clsID:  clsID,
-		sepID:  sepID,
-		padID:  padID,
-	}, nil
-}
-
-func (t *TokenizerClient) EncodeAsIds(text string) ([]int, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	text = strings.ReplaceAll(text, "\n", " ")
-	text = strings.TrimSpace(text)
-
-	if _, err := io.WriteString(t.stdin, text+"\n"); err != nil {
-		return nil, err
-	}
-
-	if !t.stdout.Scan() {
-		return nil, t.stdout.Err()
-	}
-
-	line := t.stdout.Text()
-	if line == "" {
-		return []int{}, nil
-	}
-
-	parts := strings.Split(line, ",")
-	ids := make([]int, len(parts))
-	for i, p := range parts {
-		ids[i], _ = strconv.Atoi(p)
-	}
-
-	return ids, nil
-}
-
-func (t *TokenizerClient) Close() error {
-	t.stdin.Close()
-	return t.cmd.Wait()
-}
-
-func (t *TokenizerClient) ClsID() int { return t.clsID }
-func (t *TokenizerClient) SepID() int { return t.sepID }
-
-// TokenizerPool — пул клиентов (по одному на воркера)
-type TokenizerPool struct {
-	modelPath string
-	mu        sync.Mutex
-	clients   []*TokenizerClient
-}
-
-func NewTokenizerPool(modelPath string, size int) (*TokenizerPool, error) {
-	pool := &TokenizerPool{
-		modelPath: modelPath,
-		clients:   make([]*TokenizerClient, size),
-	}
-
-	// Создаём size клиентов
-	for i := 0; i < size; i++ {
-		client, err := NewTokenizerClient(modelPath)
-		if err != nil {
-			return nil, fmt.Errorf("client %d: %w", i, err)
+	// Ждем готовности сервиса
+	log.Printf("Waiting for tokenizer service at %s...", baseURL)
+	for i := 0; i < 30; i++ {
+		resp, err := client.Get(baseURL + "/health")
+		if err == nil {
+			resp.Body.Close()
+			break
 		}
-		pool.clients[i] = client
+		time.Sleep(1 * time.Second)
 	}
 
-	log.Printf("Tokenizer pool created: %d clients", size)
-	return pool, nil
-}
-
-func (p *TokenizerPool) GetClient(workerID int) *TokenizerClient {
-	return p.clients[workerID%len(p.clients)]
-}
-
-func (p *TokenizerPool) Close() {
-	for _, c := range p.clients {
-		c.Close()
+	// Получаем специальные токены
+	resp, err := client.Get(baseURL + "/special_tokens")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get special tokens: %w", err)
 	}
+	defer resp.Body.Close()
+
+	var data struct {
+		Cls int `json:"cls"`
+		Sep int `json:"sep"`
+		Pad int `json:"pad"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, fmt.Errorf("failed to decode special tokens: %w", err)
+	}
+
+	t.clsID = data.Cls
+	t.sepID = data.Sep
+	t.padID = data.Pad
+
+	log.Printf("HTTP Tokenizer ready: [CLS]=%d, [SEP]=%d, [PAD]=%d", t.clsID, t.sepID, t.padID)
+	return t, nil
 }
 
-type ChunkBuilder struct {
-	tokenizer *TokenizerClient
-	maxLength int
-	chunkChan chan<- string
+func (t *HTTPTokenizer) EncodeAsIds(text string) ([]int, error) {
+	body := struct {
+		Text string `json:"text"`
+	}{Text: text}
+
+	jsonBody, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := t.client.Post(t.baseURL+"/tokenize", "application/json", bytes.NewReader(jsonBody))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var result struct {
+		IDs   []int  `json:"ids"`
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	if result.Error != "" {
+		return nil, fmt.Errorf(result.Error)
+	}
+
+	return result.IDs, nil
 }
+
+func (t *HTTPTokenizer) EncodeBatch(texts []string) ([][]int, error) {
+	body := struct {
+		Texts []string `json:"texts"`
+	}{Texts: texts}
+
+	jsonBody, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := t.client.Post(t.baseURL+"/tokenize_batch", "application/json", bytes.NewReader(jsonBody))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Results [][]int `json:"results"`
+		Error   string  `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	if result.Error != "" {
+		return nil, fmt.Errorf(result.Error)
+	}
+
+	return result.Results, nil
+}
+
+func (t *HTTPTokenizer) ClsID() int { return t.clsID }
+func (t *HTTPTokenizer) SepID() int { return t.sepID }
 
 func cleanChunkText(text string) string {
 	// 1. Неразрывные пробелы → обычный пробел
 	nbspRunes := []rune{
-		'\u00A0', // &nbsp;
-		'\u2007', // Figure space
-		'\u202F', // Narrow no-break space
-		'\u2060', // Word joiner
-		'\uFEFF', // Zero-width no-break space (BOM)
+		'\u00A0', '\u2007', '\u202F', '\u2060', '\uFEFF',
 		'\u2000', '\u2001', '\u2002', '\u2003', '\u2004', '\u2005', '\u2006',
 		'\u2008', '\u2009', '\u200A', '\u205F', '\u3000',
 	}
@@ -203,39 +163,29 @@ func cleanChunkText(text string) string {
 
 	// 2. Zero-width и невидимые символы → удалить
 	zeroWidthRunes := []rune{
-		'\u200B',                                         // Zero-width space
-		'\u200C',                                         // Zero-width non-joiner
-		'\u200D',                                         // Zero-width joiner
-		'\u00AD',                                         // Soft hyphen
-		'\u00AD',                                         // Soft hyphen (еще раз для надежности)
-		'\u034F',                                         // Combining grapheme joiner
-		'\u061C',                                         // Arabic letter mark
-		'\u180E',                                         // Mongolian vowel separator
-		'\uFEFF',                                         // BOM (also zero-width)
-		'\u202A', '\u202B', '\u202C', '\u202D', '\u202E', // Directional formatting
-		'\u2061', '\u2062', '\u2063', '\u2064', // Invisible operators
-		'\u2066', '\u2067', '\u2068', '\u2069', // Directional isolates
-		'\u206A', '\u206B', '\u206C', '\u206D', '\u206E', '\u206F', // Deprecated formatting
+		'\u200B', '\u200C', '\u200D', '\u00AD', '\u034F', '\u061C', '\u180E',
+		'\uFEFF', '\u202A', '\u202B', '\u202C', '\u202D', '\u202E',
+		'\u2061', '\u2062', '\u2063', '\u2064',
+		'\u2066', '\u2067', '\u2068', '\u2069',
+		'\u206A', '\u206B', '\u206C', '\u206D', '\u206E', '\u206F',
 	}
 	for _, r := range zeroWidthRunes {
 		text = strings.ReplaceAll(text, string(r), "")
 	}
 
 	// 3. Специфичные замены
-	text = strings.ReplaceAll(text, "…", "...") // Многоточие
-	text = strings.ReplaceAll(text, "–", "-")   // En dash
-	text = strings.ReplaceAll(text, "—", "-")   // Em dash
-	text = strings.ReplaceAll(text, "―", "-")   // Horizontal bar
-	text = strings.ReplaceAll(text, "−", "-")   // Minus sign
+	text = strings.ReplaceAll(text, "…", "...")
+	text = strings.ReplaceAll(text, "–", "-")
+	text = strings.ReplaceAll(text, "—", "-")
+	text = strings.ReplaceAll(text, "―", "-")
+	text = strings.ReplaceAll(text, "−", "-")
 
 	// 4. Удаление управляющих и приватных символов
 	var cleaned strings.Builder
 	for _, r := range text {
-		// Управляющие C0, C1, DEL
 		if r < 0x20 || (r >= 0x7F && r <= 0x9F) {
 			continue
 		}
-		// Приватные зоны
 		if r >= 0xE000 && r <= 0xF8FF {
 			continue
 		}
@@ -243,6 +193,12 @@ func cleanChunkText(text string) string {
 	}
 
 	return cleaned.String()
+}
+
+type ChunkBuilder struct {
+	tokenizer *HTTPTokenizer
+	maxLength int
+	chunkChan chan<- string
 }
 
 func (b *ChunkBuilder) processBook(bookFile string) (int, error) {
@@ -267,17 +223,9 @@ func (b *ChunkBuilder) processBook(bookFile string) (int, error) {
 			continue
 		}
 
-		// === ПОРЯДОК ОЧИСТКИ ===
-		text := s.Text
-
-		// 1. Очистка проблемных Unicode-символов
-		text = cleanChunkText(text)
-
-		// 2. Замена переносов строк на пробелы
+		text := cleanChunkText(s.Text)
 		text = strings.ReplaceAll(text, "\n", " ")
 		text = strings.ReplaceAll(text, "\r", " ")
-
-		// 3. Сжатие пробелов
 		text = strings.Join(strings.Fields(text), " ")
 
 		if text != "" {
@@ -289,15 +237,44 @@ func (b *ChunkBuilder) processBook(bookFile string) (int, error) {
 		return 0, nil
 	}
 
+	// Собираем все тексты для пакетной токенизации
+	texts := make([]string, len(sentences))
+	for i, s := range sentences {
+		texts[i] = s
+	}
+
+	// Пакетная токенизация (батчами по 100)
+	batchSize := 100
+	allIDs := make([][]int, len(texts))
+
+	for i := 0; i < len(texts); i += batchSize {
+		end := i + batchSize
+		if end > len(texts) {
+			end = len(texts)
+		}
+
+		batch := texts[i:end]
+		ids, err := b.tokenizer.EncodeBatch(batch)
+		if err != nil {
+			log.Printf("ERROR: batch tokenize failed: %v, falling back to single", err)
+			// Fallback: по одному
+			for j, text := range batch {
+				ids, _ := b.tokenizer.EncodeAsIds(text)
+				allIDs[i+j] = ids
+			}
+		} else {
+			for j, idList := range ids {
+				allIDs[i+j] = idList
+			}
+		}
+	}
+
 	chunksGenerated := 0
 	currentChunk := []string{}
 	currentLength := 0
 
-	for _, text := range sentences {
-		ids, err := b.tokenizer.EncodeAsIds(text)
-		if err != nil {
-			continue
-		}
+	for i, text := range sentences {
+		ids := allIDs[i]
 		sentLen := len(ids)
 
 		if sentLen == 0 {
@@ -329,9 +306,15 @@ func (b *ChunkBuilder) processBook(bookFile string) (int, error) {
 	return chunksGenerated, nil
 }
 
-func buildPhase(books []string, pool *TokenizerPool, maxLength int, outputPath string, workers int) error {
+func buildPhase(books []string, tokenizerURL string, maxLength int, outputPath string, workers int) error {
 	log.Printf("Phase max_length=%d: %d books, output=%s", maxLength, len(books), outputPath)
 	startTime := time.Now()
+
+	// Создаем ОДИН HTTP-клиент (общий для всех воркеров)
+	tokenizer, err := NewHTTPTokenizer(tokenizerURL)
+	if err != nil {
+		return fmt.Errorf("failed to create tokenizer: %w", err)
+	}
 
 	outFile, err := os.Create(outputPath)
 	if err != nil {
@@ -345,6 +328,7 @@ func buildPhase(books []string, pool *TokenizerPool, maxLength int, outputPath s
 	chunkChan := make(chan string, 10000)
 	var totalChunks int64
 	var processedBooks int64
+	var failedBooks int64
 
 	var writerWg sync.WaitGroup
 	writerWg.Add(1)
@@ -368,22 +352,30 @@ func buildPhase(books []string, pool *TokenizerPool, maxLength int, outputPath s
 		go func(workerID int) {
 			defer wg.Done()
 
-			client := pool.GetClient(workerID)
 			builder := &ChunkBuilder{
-				tokenizer: client,
+				tokenizer: tokenizer,
 				maxLength: maxLength,
 				chunkChan: chunkChan,
 			}
 
 			for book := range tasks {
-				if _, err := builder.processBook(book); err != nil {
-					log.Printf("Worker %d: error %s: %v", workerID, book, err)
+				bookName := filepath.Base(book)
+
+				chunks, err := builder.processBook(book)
+				if err != nil {
+					log.Printf("Worker %d: ERROR on %s: %v (skipping)", workerID, bookName, err)
+					atomic.AddInt64(&failedBooks, 1)
+				} else {
+					if chunks > 0 {
+						log.Printf("Worker %d: done %s, %d chunks", workerID, bookName, chunks)
+					}
 				}
 
 				processed := atomic.AddInt64(&processedBooks, 1)
 				if processed%100 == 0 {
-					log.Printf("Phase %d: %d/%d books, %d chunks",
-						maxLength, processed, len(books), atomic.LoadInt64(&totalChunks))
+					log.Printf("Phase %d: %d/%d books, %d chunks, %d failed",
+						maxLength, processed, len(books),
+						atomic.LoadInt64(&totalChunks), atomic.LoadInt64(&failedBooks))
 				}
 			}
 		}(i)
@@ -398,12 +390,13 @@ func buildPhase(books []string, pool *TokenizerPool, maxLength int, outputPath s
 				return
 			}
 			chunks := atomic.LoadInt64(&totalChunks)
+			failed := atomic.LoadInt64(&failedBooks)
 			elapsed := time.Since(startTime)
 			rate := float64(processed) / elapsed.Seconds()
-			log.Printf("Phase %d: %d/%d books (%.1f%%), %d chunks, %.1f books/sec, elapsed: %v",
+			log.Printf("Phase %d: %d/%d books (%.1f%%), %d chunks, %d failed, %.1f books/sec, elapsed: %v",
 				maxLength, processed, len(books),
 				float64(processed)/float64(len(books))*100,
-				chunks, rate, elapsed.Round(time.Second))
+				chunks, failed, rate, elapsed.Round(time.Second))
 		}
 	}()
 
@@ -413,24 +406,25 @@ func buildPhase(books []string, pool *TokenizerPool, maxLength int, outputPath s
 	writer.Flush()
 
 	elapsed := time.Since(startTime)
-	log.Printf("Phase max_length=%d COMPLETED: %d chunks in %v",
-		maxLength, totalChunks, elapsed.Round(time.Second))
+	failed := atomic.LoadInt64(&failedBooks)
+	log.Printf("Phase max_length=%d COMPLETED: %d chunks, %d failed books in %v",
+		maxLength, totalChunks, failed, elapsed.Round(time.Second))
 
 	return nil
 }
 
 func main() {
 	var (
-		cleanedDir    = flag.String("cleaned", "data/cleaned", "директория с JSONL")
-		tokenizerPath = flag.String("tokenizer", "models/tokenizer/final/sp_100k.model", "путь к модели")
-		outputDir     = flag.String("output", "data/bert", "выходная директория")
-		workers       = flag.Int("workers", 32, "количество воркеров")
+		cleanedDir   = flag.String("cleaned", "data/cleaned", "директория с JSONL")
+		tokenizerURL = flag.String("tokenizer", "http://localhost:8093", "URL сервиса токенизации")
+		outputDir    = flag.String("output", "data/bert", "выходная директория")
+		workers      = flag.Int("workers", 16, "количество воркеров")
 	)
 	flag.Parse()
 
-	log.Printf("=== Build Chunks Phased (Streaming Python) ===")
+	log.Printf("=== Build Chunks Phased (HTTP Tokenizer) ===")
 	log.Printf("Cleaned dir: %s", *cleanedDir)
-	log.Printf("Tokenizer: %s", *tokenizerPath)
+	log.Printf("Tokenizer URL: %s", *tokenizerURL)
 	log.Printf("Output dir: %s", *outputDir)
 	log.Printf("Workers: %d", *workers)
 
@@ -457,24 +451,17 @@ func main() {
 	log.Printf("Phase 2 (256): %d books", len(phase2Books))
 	log.Printf("Phase 3 (512): %d books", len(phase3Books))
 
-	// Создаём пул токенизаторов (по одному на воркера)
-	pool, err := NewTokenizerPool(*tokenizerPath, *workers)
-	if err != nil {
-		log.Fatalf("Failed to create tokenizer pool: %v", err)
-	}
-	defer pool.Close()
-
-	if err := buildPhase(phase1Books, pool, 128,
+	if err := buildPhase(phase1Books, *tokenizerURL, 128,
 		filepath.Join(*outputDir, "phase1_128.txt"), *workers); err != nil {
 		log.Fatalf("Phase 1 failed: %v", err)
 	}
 
-	if err := buildPhase(phase2Books, pool, 256,
+	if err := buildPhase(phase2Books, *tokenizerURL, 256,
 		filepath.Join(*outputDir, "phase2_256.txt"), *workers); err != nil {
 		log.Fatalf("Phase 2 failed: %v", err)
 	}
 
-	if err := buildPhase(phase3Books, pool, 512,
+	if err := buildPhase(phase3Books, *tokenizerURL, 512,
 		filepath.Join(*outputDir, "phase3_512.txt"), *workers); err != nil {
 		log.Fatalf("Phase 3 failed: %v", err)
 	}
