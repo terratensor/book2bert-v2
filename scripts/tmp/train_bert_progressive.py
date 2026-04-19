@@ -110,12 +110,11 @@ def train_phase(
     phase_name,
     train_file,
     val_file,
-    val_full_file=None,  # ← ДОБАВИТЬ (для полной валидации в конце)
-    max_length=128,
-    batch_size=32,
-    gradient_accumulation=2,
-    max_steps=400000,
-    learning_rate=5e-4,
+    max_length,
+    batch_size,
+    gradient_accumulation,
+    max_steps,
+    learning_rate,
     save_steps=5000,
     val_max_examples=100000,
 ):
@@ -194,7 +193,6 @@ def train_phase(
         logging_steps=100,
         logging_first_step=True,
         logging_dir=f"{output_dir}/logs",
-        # disable_tqdm=True,  # ← ДОБАВИТЬ (чистый лог без progress bar)
         
         # Валидация
         eval_strategy="steps",
@@ -241,41 +239,6 @@ def train_phase(
     
     logger.info(f"💾 Model saved to {final_output}")
     logger.info("=" * 80)
-
-    # ========================================================================
-    # ФИНАЛЬНАЯ ПОЛНАЯ ВАЛИДАЦИЯ
-    # ========================================================================
-    if val_full_file:
-        logger.info("=" * 60)
-        logger.info(f"📊 Running FULL validation on {val_full_file}...")
-        
-        val_full_dataset = StreamingChunkDataset(val_full_file, tokenizer, max_length)
-        logger.info(f"Full val size: {len(val_full_dataset):,} chunks")
-        
-        # Временно подменяем eval_dataset
-        original_eval = trainer.eval_dataset
-        trainer.eval_dataset = val_full_dataset
-        
-        start_time = time.time()
-        metrics = trainer.evaluate()
-        eval_time = time.time() - start_time
-        
-        trainer.eval_dataset = original_eval  # Возвращаем обратно
-        
-        logger.info(f"✅ Full validation completed in {eval_time/60:.1f} minutes")
-        logger.info(f"   Eval loss: {metrics.get('eval_loss', 'N/A'):.4f}")
-        if 'eval_loss' in metrics:
-            import torch
-            perplexity = torch.exp(torch.tensor(metrics['eval_loss'])).item()
-            logger.info(f"   Perplexity: {perplexity:.2f}")
-        logger.info("=" * 60)
-        
-        # Сохраняем метрики
-        metrics_path = f"{output_dir}/final_val_metrics.json"
-        with open(metrics_path, 'w') as f:
-            json.dump(metrics, f, indent=2)
-        logger.info(f"💾 Metrics saved to {metrics_path}")
-
     
     return trainer
 
@@ -327,7 +290,6 @@ def main():
         phase_name="phase1_128",
         train_file="data/bert/phase1_128_train.txt",
         val_file="data/bert/phase1_128_val.txt",
-        val_full_file="data/bert/phase1_128_val.txt",  # ← ДОБАВИТЬ
         max_length=128,
         batch_size=32,
         gradient_accumulation=2,
