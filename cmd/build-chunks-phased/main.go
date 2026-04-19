@@ -181,7 +181,6 @@ func (b *ChunkBuilder) processBook(bookFile string) (trainChunks, valChunks int,
 		batch := texts[i:end]
 		ids, err := b.tokenizer.EncodeBatch(batch)
 		if err != nil {
-			// fallback не нужен, сервис надёжный
 			return 0, 0, err
 		}
 		for j, idList := range ids {
@@ -199,15 +198,20 @@ func (b *ChunkBuilder) processBook(bookFile string) (trainChunks, valChunks int,
 	}
 
 	// Функция для построения чанков из подмножества предложений
-	buildChunks := func(selected []bool) int {
+	buildChunks := func(selectVal bool) int {
 		currentChunk := []string{}
 		currentLength := 0
 		chunksGenerated := 0
 
 		for i, text := range sentences {
-			if selected != nil && !selected[i] {
+			// Пропускаем предложения, которые не соответствуют выборке
+			if selectVal && !isVal[i] {
 				continue
 			}
+			if !selectVal && isVal[i] {
+				continue
+			}
+
 			ids := allIDs[i]
 			sentLen := len(ids)
 			if sentLen == 0 || sentLen > b.maxLength-2 {
@@ -216,10 +220,10 @@ func (b *ChunkBuilder) processBook(bookFile string) (trainChunks, valChunks int,
 			if currentLength+sentLen > b.maxLength-2 {
 				if len(currentChunk) > 0 {
 					chunkText := strings.Join(currentChunk, " ")
-					if selected == nil {
-						b.trainChan <- chunkText
-					} else {
+					if selectVal {
 						b.valChan <- chunkText
+					} else {
+						b.trainChan <- chunkText
 					}
 					chunksGenerated++
 				}
@@ -232,25 +236,18 @@ func (b *ChunkBuilder) processBook(bookFile string) (trainChunks, valChunks int,
 		}
 		if len(currentChunk) > 0 {
 			chunkText := strings.Join(currentChunk, " ")
-			if selected == nil {
-				b.trainChan <- chunkText
-			} else {
+			if selectVal {
 				b.valChan <- chunkText
+			} else {
+				b.trainChan <- chunkText
 			}
 			chunksGenerated++
 		}
 		return chunksGenerated
 	}
 
-	// Собираем train-чанки (из НЕ-val предложений)
-	trainSelected := make([]bool, len(sentences))
-	for i := range sentences {
-		trainSelected[i] = !isVal[i]
-	}
-	trainCount := buildChunks(trainSelected)
-
-	// Собираем val-чанки (из val-предложений)
-	valCount := buildChunks(isVal)
+	trainCount := buildChunks(false) // false = train
+	valCount := buildChunks(true)    // true = val
 
 	return trainCount, valCount, nil
 }
