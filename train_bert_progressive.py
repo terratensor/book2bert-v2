@@ -7,6 +7,10 @@
 - Фаза 2: 256 токенов, 400k шагов  
 - Фаза 3: 512 токенов, 200k шагов
 
+Валидация:
+- Быстрая: 20k примеров каждые 5000 шагов (~2 мин)
+- Полная: весь val-датасет в конце каждой фазы (~2 часа)
+
 Запуск:
 torchrun --nproc_per_node=2 train_bert_progressive.py 2>&1 | tee phase_training.log
 """
@@ -16,6 +20,7 @@ import sys
 import logging
 import glob
 import json
+import time
 import torch
 from torch.utils.data import IterableDataset
 from transformers import (
@@ -25,6 +30,7 @@ from transformers import (
     TrainingArguments,
     DataCollatorForLanguageModeling,
 )
+
 from simple_sp_tokenizer import SimpleSPTokenizer
 
 # ============================================================================
@@ -37,6 +43,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 # ============================================================================
 # ПОТОКОВЫЙ ДАТАСЕТ (не загружает всё в память)
 # ============================================================================
@@ -45,9 +52,7 @@ class StreamingChunkDataset(IterableDataset):
     """
     Потоковое чтение чанков из текстового файла.
     
-    Каждая строка файла = один чанк (несколько предложений, объединённых пробелами).
-    При итерации читаем строку, токенизируем на лету, отдаём батч.
-    
+    Каждая строка файла = один чанк.
     ПАМЯТЬ: O(1) — в памяти только текущая строка.
     """
     
@@ -59,7 +64,7 @@ class StreamingChunkDataset(IterableDataset):
         self._len = None
     
     def __len__(self):
-        """Быстрый подсчёт строк через wc -l."""
+        """Возвращает РЕАЛЬНОЕ количество примеров с учётом max_examples."""
         if self._len is None:
             import subprocess
             result = subprocess.run(
@@ -84,7 +89,6 @@ class StreamingChunkDataset(IterableDataset):
                 if not text:
                     continue
                 
-                # ТОКЕНИЗАЦИЯ НА ЛЕТУ
                 encoded = self.tokenizer(
                     text,
                     max_length=self.max_length,
@@ -101,6 +105,62 @@ class StreamingChunkDataset(IterableDataset):
 
 
 # ============================================================================
+# ПОЛНАЯ ВАЛИДАЦИЯ (выполняется один раз в конце фазы)
+# ============================================================================
+
+def full_validation(model, tokenizer, val_file, max_length, phase_name, batch_size=32):
+    """
+    Полная валидация на ВСЁМ val-датасете (1.1M примеров).
+    Занимает ~2 часа.
+    """
+    logger.info("=" * 80)
+    logger.info(f"🔍 FULL VALIDATION for {phase_name}")
+    logger.info(f"   Val file: {val_file}")
+    logger.info(f"   Max length: {max_length}")
+    logger.info("=" * 80)
+    
+    # Полный датасет без ограничений
+    full_val_dataset = StreamingChunkDataset(val_file, tokenizer, max_length)
+    logger.info(f"   Full val size: {len(full_val_dataset):,} chunks")
+    
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=True,
+        mlm_probability=0.15,
+    )
+    
+    # Trainer только для валидации (без логирования, без прогресс-бара)
+    val_args = TrainingArguments(
+        output_dir=f"models/bert-base-ru-{phase_name}-full-val",
+        per_device_eval_batch_size=batch_size,
+        fp16=True,
+        ddp_find_unused_parameters=False,
+        ddp_backend="nccl",
+        report_to=[],       # без TensorBoard
+        # disable_tqdm=True,  # без прогресс-бара
+    )
+    
+    trainer = Trainer(
+        model=model,
+        args=val_args,
+        data_collator=data_collator,
+    )
+    
+    start_time = time.time()
+    metrics = trainer.evaluate(eval_dataset=full_val_dataset)
+    elapsed = time.time() - start_time
+    
+    perplexity = torch.exp(torch.tensor(metrics['eval_loss']))
+    
+    logger.info(f"   ✅ Full validation done in {elapsed/60:.1f} min")
+    logger.info(f"   Loss: {metrics['eval_loss']:.4f}")
+    logger.info(f"   Perplexity: {perplexity:.2f}")
+    logger.info("=" * 80)
+    
+    return metrics
+
+
+# ============================================================================
 # ФУНКЦИЯ ОБУЧЕНИЯ ОДНОЙ ФАЗЫ
 # ============================================================================
 
@@ -110,14 +170,14 @@ def train_phase(
     phase_name,
     train_file,
     val_file,
-    val_full_file=None,  # ← ДОБАВИТЬ (для полной валидации в конце)
-    max_length=128,
-    batch_size=32,
-    gradient_accumulation=2,
-    max_steps=400000,
-    learning_rate=5e-4,
+    max_length,
+    batch_size,
+    gradient_accumulation,
+    max_steps,
+    learning_rate,
     save_steps=5000,
-    val_max_examples=100000,
+    val_max_examples=20000,
+    do_full_validation=True,
 ):
     """
     Обучает модель одну фазу и сохраняет результат.
@@ -127,34 +187,35 @@ def train_phase(
     """
     
     logger.info("=" * 80)
-    logger.info(f"PHASE: {phase_name}")
-    logger.info(f"  Train file: {train_file}")
-    logger.info(f"  Val file:   {val_file}")
-    logger.info(f"  Max length: {max_length}")
-    logger.info(f"  Batch size: {batch_size} × {gradient_accumulation} × 2 GPUs = {batch_size * gradient_accumulation * 2}")
-    logger.info(f"  Max steps:  {max_steps:,}")
-    logger.info(f"  Save every: {save_steps:,} steps")
-    logger.info(f"  Val samples: {val_max_examples:,} (для быстрой валидации)")
-    logger.info(f"  LR:         {learning_rate}")
+    logger.info(f"🚀 PHASE: {phase_name}")
+    logger.info(f"   Train file: {train_file}")
+    logger.info(f"   Val file:   {val_file}")
+    logger.info(f"   Max length: {max_length}")
+    logger.info(f"   Batch size: {batch_size} × {gradient_accumulation} × 2 GPUs = {batch_size * gradient_accumulation * 2}")
+    logger.info(f"   Max steps:  {max_steps:,}")
+    logger.info(f"   Save every: {save_steps:,} steps")
+    logger.info(f"   Fast val:   {val_max_examples:,} samples")
+    logger.info(f"   Full val:   {'Yes' if do_full_validation else 'No'}")
+    logger.info(f"   LR:         {learning_rate}")
     logger.info("=" * 80)
     
-    # Создаём потоковые датасеты
+    # Датасеты
     train_dataset = StreamingChunkDataset(train_file, tokenizer, max_length)
     val_dataset = StreamingChunkDataset(
         val_file, tokenizer, max_length, max_examples=val_max_examples
     )
     
     logger.info(f"Train dataset size: {len(train_dataset):,} chunks")
-    logger.info(f"Val dataset size:   {len(val_dataset):,} chunks (ограничено)")
+    logger.info(f"Fast val size:      {len(val_dataset):,} chunks")
     
-    # DataCollator для MLM
+    # DataCollator
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=True,
         mlm_probability=0.15,
     )
     
-    # Проверяем наличие чекпоинтов
+    # Проверяем чекпоинты
     output_dir = f"models/bert-base-ru-{phase_name}"
     resume_from_checkpoint = None
     
@@ -169,7 +230,7 @@ def train_phase(
                 with open(state_path) as f:
                     state = json.load(f)
                 steps_done = state.get('global_step', 0)
-                logger.info(f"  Already trained: {steps_done:,} steps ({steps_done/max_steps*100:.1f}%)")
+                logger.info(f"   Already trained: {steps_done:,} steps ({steps_done/max_steps*100:.1f}%)")
     
     # Аргументы обучения
     training_args = TrainingArguments(
@@ -192,11 +253,7 @@ def train_phase(
         # Логирование
         logging_strategy="steps",
         logging_steps=100,
-        logging_first_step=True,
-        logging_dir=f"{output_dir}/logs",
-        # disable_tqdm=True,  # ← ДОБАВИТЬ (чистый лог без progress bar)
-        
-        # Валидация
+        logging_first_step=True,        
         eval_strategy="steps",
         eval_steps=save_steps,
         
@@ -227,12 +284,16 @@ def train_phase(
         eval_dataset=val_dataset,
     )
     
-    logger.info(f"🚀 Starting training for {max_steps:,} steps...")
+    logger.info(f"🎯 Starting training for {max_steps:,} steps...")
     
     train_result = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     
     logger.info(f"✅ Training completed! Total steps: {train_result.global_step:,}")
-    logger.info(f"   Final loss: {train_result.training_loss:.4f}")
+    logger.info(f"   Final training loss: {train_result.training_loss:.4f}")
+    
+    # ПОЛНАЯ ВАЛИДАЦИЯ В КОНЦЕ ФАЗЫ
+    if do_full_validation:
+        full_validation(model, tokenizer, val_file, max_length, phase_name, batch_size)
     
     # Сохраняем модель
     final_output = f"models/bert-base-ru-{phase_name}-final"
@@ -241,41 +302,6 @@ def train_phase(
     
     logger.info(f"💾 Model saved to {final_output}")
     logger.info("=" * 80)
-
-    # ========================================================================
-    # ФИНАЛЬНАЯ ПОЛНАЯ ВАЛИДАЦИЯ
-    # ========================================================================
-    if val_full_file:
-        logger.info("=" * 60)
-        logger.info(f"📊 Running FULL validation on {val_full_file}...")
-        
-        val_full_dataset = StreamingChunkDataset(val_full_file, tokenizer, max_length)
-        logger.info(f"Full val size: {len(val_full_dataset):,} chunks")
-        
-        # Временно подменяем eval_dataset
-        original_eval = trainer.eval_dataset
-        trainer.eval_dataset = val_full_dataset
-        
-        start_time = time.time()
-        metrics = trainer.evaluate()
-        eval_time = time.time() - start_time
-        
-        trainer.eval_dataset = original_eval  # Возвращаем обратно
-        
-        logger.info(f"✅ Full validation completed in {eval_time/60:.1f} minutes")
-        logger.info(f"   Eval loss: {metrics.get('eval_loss', 'N/A'):.4f}")
-        if 'eval_loss' in metrics:
-            import torch
-            perplexity = torch.exp(torch.tensor(metrics['eval_loss'])).item()
-            logger.info(f"   Perplexity: {perplexity:.2f}")
-        logger.info("=" * 60)
-        
-        # Сохраняем метрики
-        metrics_path = f"{output_dir}/final_val_metrics.json"
-        with open(metrics_path, 'w') as f:
-            json.dump(metrics, f, indent=2)
-        logger.info(f"💾 Metrics saved to {metrics_path}")
-
     
     return trainer
 
@@ -299,14 +325,14 @@ def main():
     logger.info(f"Vocab size: {tokenizer.vocab_size}")
     logger.info(f"Special tokens: CLS={tokenizer.cls_token_id}, SEP={tokenizer.sep_token_id}, PAD={tokenizer.pad_token_id}")
     
-    # Создаём модель BERT-base
+    # Создаём модель BERT-base (110M параметров)
     config = BertConfig(
         vocab_size=tokenizer.vocab_size,
         hidden_size=768,
         num_hidden_layers=12,
         num_attention_heads=12,
         intermediate_size=3072,
-        max_position_embeddings=512,
+        max_position_embeddings=512,  # Сразу 512 для всех фаз!
         type_vocab_size=2,
         hidden_dropout_prob=0.1,
         attention_probs_dropout_prob=0.1,
@@ -320,24 +346,28 @@ def main():
     config.save_pretrained("models/bert-base-ru-config")
     logger.info("Config saved to models/bert-base-ru-config")
     
-    # ФАЗА 1: 128 токенов
+    # ========================================================================
+    # ФАЗА 1: 128 токенов, 400k шагов
+    # ========================================================================
     train_phase(
         model=model,
         tokenizer=tokenizer,
         phase_name="phase1_128",
         train_file="data/bert/phase1_128_train.txt",
         val_file="data/bert/phase1_128_val.txt",
-        val_full_file="data/bert/phase1_128_val.txt",  # ← ДОБАВИТЬ
         max_length=128,
         batch_size=32,
         gradient_accumulation=2,
         max_steps=400_000,
         learning_rate=5e-4,
         save_steps=5000,
-        val_max_examples=100000,
+        val_max_examples=20000,
+        do_full_validation=True,
     )
     
-    # ФАЗА 2: 256 токенов
+    # ========================================================================
+    # ФАЗА 2: 256 токенов, 400k шагов
+    # ========================================================================
     train_phase(
         model=model,
         tokenizer=tokenizer,
@@ -350,10 +380,13 @@ def main():
         max_steps=400_000,
         learning_rate=3e-4,
         save_steps=5000,
-        val_max_examples=100000,
+        val_max_examples=20000,
+        do_full_validation=True,
     )
     
-    # ФАЗА 3: 512 токенов
+    # ========================================================================
+    # ФАЗА 3: 512 токенов, 200k шагов
+    # ========================================================================
     train_phase(
         model=model,
         tokenizer=tokenizer,
@@ -366,10 +399,13 @@ def main():
         max_steps=200_000,
         learning_rate=1e-4,
         save_steps=5000,
-        val_max_examples=100000,
+        val_max_examples=20000,
+        do_full_validation=True,
     )
     
-    # Сохраняем финальную модель
+    # ========================================================================
+    # ФИНАЛЬНОЕ СОХРАНЕНИЕ
+    # ========================================================================
     final_output = "models/bert-base-ru-final"
     model.save_pretrained(final_output)
     tokenizer.save_pretrained(final_output)
