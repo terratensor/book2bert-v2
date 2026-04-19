@@ -6,8 +6,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,7 +22,6 @@ type Sentence struct {
 	Text string `json:"text"`
 }
 
-// HTTPTokenizer — клиент к HTTP-сервису токенизации
 type HTTPTokenizer struct {
 	baseURL string
 	client  *http.Client
@@ -40,12 +39,8 @@ func NewHTTPTokenizer(baseURL string) (*HTTPTokenizer, error) {
 		},
 	}
 
-	t := &HTTPTokenizer{
-		baseURL: baseURL,
-		client:  client,
-	}
+	t := &HTTPTokenizer{baseURL: baseURL, client: client}
 
-	// Ждем готовности сервиса
 	log.Printf("Waiting for tokenizer service at %s...", baseURL)
 	for i := 0; i < 30; i++ {
 		resp, err := client.Get(baseURL + "/health")
@@ -56,7 +51,6 @@ func NewHTTPTokenizer(baseURL string) (*HTTPTokenizer, error) {
 		time.Sleep(1 * time.Second)
 	}
 
-	// Получаем специальные токены
 	resp, err := client.Get(baseURL + "/special_tokens")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get special tokens: %w", err)
@@ -68,9 +62,7 @@ func NewHTTPTokenizer(baseURL string) (*HTTPTokenizer, error) {
 		Sep int `json:"sep"`
 		Pad int `json:"pad"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return nil, fmt.Errorf("failed to decode special tokens: %w", err)
-	}
+	json.NewDecoder(resp.Body).Decode(&data)
 
 	t.clsID = data.Cls
 	t.sepID = data.Sep
@@ -80,52 +72,12 @@ func NewHTTPTokenizer(baseURL string) (*HTTPTokenizer, error) {
 	return t, nil
 }
 
-func (t *HTTPTokenizer) EncodeAsIds(text string) ([]int, error) {
-	body := struct {
-		Text string `json:"text"`
-	}{Text: text}
-
-	jsonBody, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := t.client.Post(t.baseURL+"/tokenize", "application/json", bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	var result struct {
-		IDs   []int  `json:"ids"`
-		Error string `json:"error"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
-
-	if result.Error != "" {
-		return nil, fmt.Errorf(result.Error)
-	}
-
-	return result.IDs, nil
-}
-
 func (t *HTTPTokenizer) EncodeBatch(texts []string) ([][]int, error) {
 	body := struct {
 		Texts []string `json:"texts"`
 	}{Texts: texts}
 
-	jsonBody, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-
+	jsonBody, _ := json.Marshal(body)
 	resp, err := t.client.Post(t.baseURL+"/tokenize_batch", "application/json", bytes.NewReader(jsonBody))
 	if err != nil {
 		return nil, err
@@ -136,51 +88,29 @@ func (t *HTTPTokenizer) EncodeBatch(texts []string) ([][]int, error) {
 		Results [][]int `json:"results"`
 		Error   string  `json:"error"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
+	json.NewDecoder(resp.Body).Decode(&result)
 
 	if result.Error != "" {
 		return nil, fmt.Errorf(result.Error)
 	}
-
 	return result.Results, nil
 }
 
-func (t *HTTPTokenizer) ClsID() int { return t.clsID }
-func (t *HTTPTokenizer) SepID() int { return t.sepID }
-
 func cleanChunkText(text string) string {
-	// 1. Неразрывные пробелы → обычный пробел
-	nbspRunes := []rune{
-		'\u00A0', '\u2007', '\u202F', '\u2060', '\uFEFF',
-		'\u2000', '\u2001', '\u2002', '\u2003', '\u2004', '\u2005', '\u2006',
-		'\u2008', '\u2009', '\u200A', '\u205F', '\u3000',
-	}
+	nbspRunes := []rune{'\u00A0', '\u2007', '\u202F', '\u2060', '\uFEFF', '\u2000', '\u2001', '\u2002', '\u2003', '\u2004', '\u2005', '\u2006', '\u2008', '\u2009', '\u200A', '\u205F', '\u3000'}
 	for _, r := range nbspRunes {
 		text = strings.ReplaceAll(text, string(r), " ")
 	}
-
-	// 2. Zero-width и невидимые символы → удалить
-	zeroWidthRunes := []rune{
-		'\u200B', '\u200C', '\u200D', '\u00AD', '\u034F', '\u061C', '\u180E',
-		'\uFEFF', '\u202A', '\u202B', '\u202C', '\u202D', '\u202E',
-		'\u2061', '\u2062', '\u2063', '\u2064',
-		'\u2066', '\u2067', '\u2068', '\u2069',
-		'\u206A', '\u206B', '\u206C', '\u206D', '\u206E', '\u206F',
-	}
+	zeroWidthRunes := []rune{'\u200B', '\u200C', '\u200D', '\u00AD', '\u034F', '\u061C', '\u180E', '\uFEFF', '\u202A', '\u202B', '\u202C', '\u202D', '\u202E', '\u2061', '\u2062', '\u2063', '\u2064', '\u2066', '\u2067', '\u2068', '\u2069', '\u206A', '\u206B', '\u206C', '\u206D', '\u206E', '\u206F'}
 	for _, r := range zeroWidthRunes {
 		text = strings.ReplaceAll(text, string(r), "")
 	}
-
-	// 3. Специфичные замены
 	text = strings.ReplaceAll(text, "…", "...")
 	text = strings.ReplaceAll(text, "–", "-")
 	text = strings.ReplaceAll(text, "—", "-")
 	text = strings.ReplaceAll(text, "―", "-")
 	text = strings.ReplaceAll(text, "−", "-")
 
-	// 4. Удаление управляющих и приватных символов
 	var cleaned strings.Builder
 	for _, r := range text {
 		if r < 0x20 || (r >= 0x7F && r <= 0x9F) {
@@ -191,20 +121,21 @@ func cleanChunkText(text string) string {
 		}
 		cleaned.WriteRune(r)
 	}
-
 	return cleaned.String()
 }
 
 type ChunkBuilder struct {
 	tokenizer *HTTPTokenizer
 	maxLength int
-	chunkChan chan<- string
+	trainChan chan<- string
+	valChan   chan<- string
+	valRatio  float64
 }
 
-func (b *ChunkBuilder) processBook(bookFile string) (int, error) {
+func (b *ChunkBuilder) processBook(bookFile string) (trainChunks, valChunks int, err error) {
 	file, err := os.Open(bookFile)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer file.Close()
 
@@ -217,126 +148,167 @@ func (b *ChunkBuilder) processBook(bookFile string) (int, error) {
 		if len(line) == 0 {
 			continue
 		}
-
 		var s Sentence
 		if err := json.Unmarshal(line, &s); err != nil {
 			continue
 		}
-
 		text := cleanChunkText(s.Text)
 		text = strings.ReplaceAll(text, "\n", " ")
 		text = strings.ReplaceAll(text, "\r", " ")
 		text = strings.Join(strings.Fields(text), " ")
-
 		if text != "" {
 			sentences = append(sentences, text)
 		}
 	}
 
 	if len(sentences) == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 
-	// Собираем все тексты для пакетной токенизации
+	// Токенизируем все предложения батчами
 	texts := make([]string, len(sentences))
 	for i, s := range sentences {
 		texts[i] = s
 	}
 
-	// Пакетная токенизация (батчами по 100)
-	batchSize := 100
 	allIDs := make([][]int, len(texts))
-
+	batchSize := 100
 	for i := 0; i < len(texts); i += batchSize {
 		end := i + batchSize
 		if end > len(texts) {
 			end = len(texts)
 		}
-
 		batch := texts[i:end]
 		ids, err := b.tokenizer.EncodeBatch(batch)
 		if err != nil {
-			log.Printf("ERROR: batch tokenize failed: %v, falling back to single", err)
-			// Fallback: по одному
-			for j, text := range batch {
-				ids, _ := b.tokenizer.EncodeAsIds(text)
-				allIDs[i+j] = ids
-			}
-		} else {
-			for j, idList := range ids {
-				allIDs[i+j] = idList
-			}
+			// fallback не нужен, сервис надёжный
+			return 0, 0, err
+		}
+		for j, idList := range ids {
+			allIDs[i+j] = idList
 		}
 	}
 
-	chunksGenerated := 0
-	currentChunk := []string{}
-	currentLength := 0
-
-	for i, text := range sentences {
-		ids := allIDs[i]
-		sentLen := len(ids)
-
-		if sentLen == 0 {
-			continue
+	// Случайно выбираем val-предложения на уровне предложений
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	isVal := make([]bool, len(sentences))
+	for i := range sentences {
+		if rng.Float64() < b.valRatio {
+			isVal[i] = true
 		}
+	}
 
-		if sentLen > b.maxLength-2 {
-			continue
-		}
+	// Функция для построения чанков из подмножества предложений
+	buildChunks := func(selected []bool) int {
+		currentChunk := []string{}
+		currentLength := 0
+		chunksGenerated := 0
 
-		if currentLength+sentLen > b.maxLength-2 {
-			if len(currentChunk) > 0 {
-				b.chunkChan <- strings.Join(currentChunk, " ")
-				chunksGenerated++
+		for i, text := range sentences {
+			if selected != nil && !selected[i] {
+				continue
 			}
-			currentChunk = []string{text}
-			currentLength = sentLen
-		} else {
-			currentChunk = append(currentChunk, text)
-			currentLength += sentLen
+			ids := allIDs[i]
+			sentLen := len(ids)
+			if sentLen == 0 || sentLen > b.maxLength-2 {
+				continue
+			}
+			if currentLength+sentLen > b.maxLength-2 {
+				if len(currentChunk) > 0 {
+					chunkText := strings.Join(currentChunk, " ")
+					if selected == nil {
+						b.trainChan <- chunkText
+					} else {
+						b.valChan <- chunkText
+					}
+					chunksGenerated++
+				}
+				currentChunk = []string{text}
+				currentLength = sentLen
+			} else {
+				currentChunk = append(currentChunk, text)
+				currentLength += sentLen
+			}
 		}
+		if len(currentChunk) > 0 {
+			chunkText := strings.Join(currentChunk, " ")
+			if selected == nil {
+				b.trainChan <- chunkText
+			} else {
+				b.valChan <- chunkText
+			}
+			chunksGenerated++
+		}
+		return chunksGenerated
 	}
 
-	if len(currentChunk) > 0 {
-		b.chunkChan <- strings.Join(currentChunk, " ")
-		chunksGenerated++
+	// Собираем train-чанки (из НЕ-val предложений)
+	trainSelected := make([]bool, len(sentences))
+	for i := range sentences {
+		trainSelected[i] = !isVal[i]
 	}
+	trainCount := buildChunks(trainSelected)
 
-	return chunksGenerated, nil
+	// Собираем val-чанки (из val-предложений)
+	valCount := buildChunks(isVal)
+
+	return trainCount, valCount, nil
 }
 
-func buildPhase(books []string, tokenizerURL string, maxLength int, outputPath string, workers int) error {
-	log.Printf("Phase max_length=%d: %d books, output=%s", maxLength, len(books), outputPath)
+func buildPhase(books []string, tokenizerURL string, maxLength int, trainOutput, valOutput string, workers int, valRatio float64) error {
+	log.Printf("Phase max_length=%d: %d books", maxLength, len(books))
+	log.Printf("  Train output: %s", trainOutput)
+	log.Printf("  Val output: %s", valOutput)
+	log.Printf("  Val ratio: %.1f%%", valRatio*100)
 	startTime := time.Now()
 
-	// Создаем ОДИН HTTP-клиент (общий для всех воркеров)
 	tokenizer, err := NewHTTPTokenizer(tokenizerURL)
 	if err != nil {
 		return fmt.Errorf("failed to create tokenizer: %w", err)
 	}
 
-	outFile, err := os.Create(outputPath)
+	// Открываем выходные файлы
+	trainFile, err := os.Create(trainOutput)
 	if err != nil {
 		return err
 	}
-	defer outFile.Close()
+	defer trainFile.Close()
+	trainWriter := bufio.NewWriterSize(trainFile, 8*1024*1024)
+	defer trainWriter.Flush()
 
-	writer := bufio.NewWriterSize(outFile, 8*1024*1024)
-	defer writer.Flush()
+	valFile, err := os.Create(valOutput)
+	if err != nil {
+		return err
+	}
+	defer valFile.Close()
+	valWriter := bufio.NewWriterSize(valFile, 8*1024*1024)
+	defer valWriter.Flush()
 
-	chunkChan := make(chan string, 10000)
-	var totalChunks int64
-	var processedBooks int64
-	var failedBooks int64
+	trainChan := make(chan string, 10000)
+	valChan := make(chan string, 10000)
 
-	var writerWg sync.WaitGroup
-	writerWg.Add(1)
+	var totalTrainChunks, totalValChunks int64
+	var processedBooks, failedBooks int64
+
+	// Writer для train
+	var trainWg sync.WaitGroup
+	trainWg.Add(1)
 	go func() {
-		defer writerWg.Done()
-		for chunk := range chunkChan {
-			writer.WriteString(chunk + "\n")
-			atomic.AddInt64(&totalChunks, 1)
+		defer trainWg.Done()
+		for chunk := range trainChan {
+			trainWriter.WriteString(chunk + "\n")
+			atomic.AddInt64(&totalTrainChunks, 1)
+		}
+	}()
+
+	// Writer для val
+	var valWg sync.WaitGroup
+	valWg.Add(1)
+	go func() {
+		defer valWg.Done()
+		for chunk := range valChan {
+			valWriter.WriteString(chunk + "\n")
+			atomic.AddInt64(&totalValChunks, 1)
 		}
 	}()
 
@@ -351,31 +323,30 @@ func buildPhase(books []string, tokenizerURL string, maxLength int, outputPath s
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-
 			builder := &ChunkBuilder{
 				tokenizer: tokenizer,
 				maxLength: maxLength,
-				chunkChan: chunkChan,
+				trainChan: trainChan,
+				valChan:   valChan,
+				valRatio:  valRatio,
 			}
-
 			for book := range tasks {
 				bookName := filepath.Base(book)
-
-				chunks, err := builder.processBook(book)
+				trainChunks, valChunks, err := builder.processBook(book)
 				if err != nil {
-					log.Printf("Worker %d: ERROR on %s: %v (skipping)", workerID, bookName, err)
+					log.Printf("Worker %d: ERROR on %s: %v", workerID, bookName, err)
 					atomic.AddInt64(&failedBooks, 1)
 				} else {
-					if chunks > 0 {
-						log.Printf("Worker %d: done %s, %d chunks", workerID, bookName, chunks)
+					if trainChunks+valChunks > 0 {
+						log.Printf("Worker %d: %s -> train=%d, val=%d", workerID, bookName, trainChunks, valChunks)
 					}
 				}
-
 				processed := atomic.AddInt64(&processedBooks, 1)
 				if processed%100 == 0 {
-					log.Printf("Phase %d: %d/%d books, %d chunks, %d failed",
+					log.Printf("Phase %d: %d/%d books, train=%d, val=%d chunks, %d failed",
 						maxLength, processed, len(books),
-						atomic.LoadInt64(&totalChunks), atomic.LoadInt64(&failedBooks))
+						atomic.LoadInt64(&totalTrainChunks), atomic.LoadInt64(&totalValChunks),
+						atomic.LoadInt64(&failedBooks))
 				}
 			}
 		}(i)
@@ -389,26 +360,29 @@ func buildPhase(books []string, tokenizerURL string, maxLength int, outputPath s
 			if processed >= int64(len(books)) {
 				return
 			}
-			chunks := atomic.LoadInt64(&totalChunks)
+			train := atomic.LoadInt64(&totalTrainChunks)
+			val := atomic.LoadInt64(&totalValChunks)
 			failed := atomic.LoadInt64(&failedBooks)
 			elapsed := time.Since(startTime)
 			rate := float64(processed) / elapsed.Seconds()
-			log.Printf("Phase %d: %d/%d books (%.1f%%), %d chunks, %d failed, %.1f books/sec, elapsed: %v",
+			log.Printf("Phase %d: %d/%d books (%.1f%%), train=%d, val=%d, %d failed, %.1f books/sec, %v",
 				maxLength, processed, len(books),
 				float64(processed)/float64(len(books))*100,
-				chunks, failed, rate, elapsed.Round(time.Second))
+				train, val, failed, rate, elapsed.Round(time.Second))
 		}
 	}()
 
 	wg.Wait()
-	close(chunkChan)
-	writerWg.Wait()
-	writer.Flush()
+	close(trainChan)
+	close(valChan)
+	trainWg.Wait()
+	valWg.Wait()
+	trainWriter.Flush()
+	valWriter.Flush()
 
 	elapsed := time.Since(startTime)
-	failed := atomic.LoadInt64(&failedBooks)
-	log.Printf("Phase max_length=%d COMPLETED: %d chunks, %d failed books in %v",
-		maxLength, totalChunks, failed, elapsed.Round(time.Second))
+	log.Printf("Phase max_length=%d COMPLETED: train=%d, val=%d chunks, %d failed in %v",
+		maxLength, totalTrainChunks, totalValChunks, failedBooks, elapsed.Round(time.Second))
 
 	return nil
 }
@@ -416,17 +390,19 @@ func buildPhase(books []string, tokenizerURL string, maxLength int, outputPath s
 func main() {
 	var (
 		cleanedDir   = flag.String("cleaned", "data/cleaned", "директория с JSONL")
-		tokenizerURL = flag.String("tokenizer", "http://localhost:8093", "URL сервиса токенизации")
+		tokenizerURL = flag.String("tokenizer", "http://localhost:8091", "URL сервиса токенизации")
 		outputDir    = flag.String("output", "data/bert", "выходная директория")
 		workers      = flag.Int("workers", 16, "количество воркеров")
+		valRatio     = flag.Float64("val-ratio", 0.02, "доля предложений на валидацию")
 	)
 	flag.Parse()
 
-	log.Printf("=== Build Chunks Phased (HTTP Tokenizer) ===")
+	log.Printf("=== Build Chunks Phased (Train/Val Split per Book) ===")
 	log.Printf("Cleaned dir: %s", *cleanedDir)
 	log.Printf("Tokenizer URL: %s", *tokenizerURL)
 	log.Printf("Output dir: %s", *outputDir)
 	log.Printf("Workers: %d", *workers)
+	log.Printf("Val ratio: %.1f%%", *valRatio*100)
 
 	if err := os.MkdirAll(*outputDir, 0755); err != nil {
 		log.Fatalf("Failed to create output dir: %v", err)
@@ -440,6 +416,7 @@ func main() {
 	log.Printf("Found %d books", len(books))
 	sort.Strings(books)
 
+	// Разбиваем книги на три фазы (разные книги для разных длин)
 	n := len(books)
 	phaseSize := n / 3
 
@@ -451,18 +428,27 @@ func main() {
 	log.Printf("Phase 2 (256): %d books", len(phase2Books))
 	log.Printf("Phase 3 (512): %d books", len(phase3Books))
 
+	// Фаза 1
 	if err := buildPhase(phase1Books, *tokenizerURL, 128,
-		filepath.Join(*outputDir, "phase1_128.txt"), *workers); err != nil {
+		filepath.Join(*outputDir, "phase1_128_train.txt"),
+		filepath.Join(*outputDir, "phase1_128_val.txt"),
+		*workers, *valRatio); err != nil {
 		log.Fatalf("Phase 1 failed: %v", err)
 	}
 
+	// Фаза 2
 	if err := buildPhase(phase2Books, *tokenizerURL, 256,
-		filepath.Join(*outputDir, "phase2_256.txt"), *workers); err != nil {
+		filepath.Join(*outputDir, "phase2_256_train.txt"),
+		filepath.Join(*outputDir, "phase2_256_val.txt"),
+		*workers, *valRatio); err != nil {
 		log.Fatalf("Phase 2 failed: %v", err)
 	}
 
+	// Фаза 3
 	if err := buildPhase(phase3Books, *tokenizerURL, 512,
-		filepath.Join(*outputDir, "phase3_512.txt"), *workers); err != nil {
+		filepath.Join(*outputDir, "phase3_512_train.txt"),
+		filepath.Join(*outputDir, "phase3_512_val.txt"),
+		*workers, *valRatio); err != nil {
 		log.Fatalf("Phase 3 failed: %v", err)
 	}
 
