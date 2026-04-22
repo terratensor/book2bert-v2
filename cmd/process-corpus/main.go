@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -17,7 +19,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/terratensor/book2bert-v2/pkg/adapters/filerepo"
 	segmenterAdapter "github.com/terratensor/book2bert-v2/pkg/adapters/segmenter"
 	"github.com/terratensor/book2bert-v2/pkg/core/book"
@@ -55,6 +56,21 @@ type BookMeta struct {
 	Author     string `json:"author,omitempty"`
 	Genre      string `json:"genre,omitempty"`
 	SourceFile string `json:"source_file"`
+}
+
+// generateBookID создает детерминированный ID книги на основе пути и метаданных
+func generateBookID(sourcePath, title, author string) string {
+	// Нормализуем путь: убираем расширения и приводим к нижнему регистру
+	normalizedPath := strings.ToLower(sourcePath)
+	normalizedPath = strings.TrimSuffix(normalizedPath, ".gz")
+	normalizedPath = strings.TrimSuffix(normalizedPath, ".txt")
+
+	// Создаем строку для хеширования
+	data := fmt.Sprintf("%s|%s|%s", normalizedPath, title, author)
+
+	// SHA256 и берем первые 16 символов (64 бита)
+	hash := sha256.Sum256([]byte(data))
+	return hex.EncodeToString(hash[:8]) // 16 символов hex
 }
 
 // parseMetadataFromFilename извлекает жанр, автора и название из имени файла
@@ -190,8 +206,8 @@ func processFile(ctx context.Context, task FileTask, seg segmenter.Segmenter, re
 		return
 	}
 
-	// 11. Генерируем уникальный ID для книги
-	bookID := uuid.New().String()
+	// 11. Генерируем детерминированный ID для книги
+	bookID := generateBookID(task.Path, title, author)
 
 	// 12. Отправляем метаданные в отдельный файл (не дублируются в предложениях)
 	metaChan <- BookMeta{
