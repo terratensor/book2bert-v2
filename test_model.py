@@ -185,7 +185,7 @@ def test_on_random_sentences(jsonl_file, model, tokenizer, num_examples=5):
         words[mask_idx] = '[MASK]'
         masked_text = ' '.join(words)
         
-        predictions = predict_masked(masked_text, model, tokenizer, top_k=3)
+        predictions = predict_masked(masked_text, model, tokenizer, top_k=10)
         
         results.append({
             'original': sent,
@@ -284,13 +284,22 @@ def main():
         
         test_texts = [
             "Москва — [MASK] России",
+            "Столица России [MASK]",
             "The capital of France is [MASK]",
             "Внимание — это [MASK], что вам нужно",
             "α = 0.[MASK]",
-        ]
+            "2 + 2 = [MASK]",
+            "Я [MASK] в магазин",           # ожидаем: пошёл, иду
+            "Он [MASK] книгу",              # ожидаем: читает, взял
+            "1, 2, [MASK], 4",              # ожидаем: 3
+            "Красный, жёлтый, [MASK]",     # ожидаем: синий, жёлтый
+            "Владимир Владимирович [MASK] ",
+            "Президент США [MASK] ",
+            "Здравствуйте, как [MASK]?",
+        ]        
         
         for text in test_texts:
-            predictions = predict_masked(text, model, tokenizer, top_k=3)
+            predictions = predict_masked(text, model, tokenizer, top_k=10)
             print(f"\n{text}")
             for word, prob in predictions:
                 print(f"  → {word} ({prob:.3f})")

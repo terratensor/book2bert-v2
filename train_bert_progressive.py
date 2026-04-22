@@ -257,6 +257,10 @@ def train_phase(
         eval_strategy="steps",
         eval_steps=save_steps,
         
+        max_grad_norm=1.0,  # ← ДОБАВИТЬ
+        # lr_scheduler_type="cosine",  # ← ДОБАВИТЬ (вместо linear)
+        lr_scheduler_type="constant",  # ← ДОБАВИТЬ (вместо linear)
+
         # Оптимизатор
         learning_rate=learning_rate,
         warmup_steps=int(max_steps * 0.01),
@@ -270,6 +274,9 @@ def train_phase(
         
         # Логи
         report_to="tensorboard",
+        
+        # Прогресс-бар
+        disable_tqdm=False,
         
         # Multi-GPU
         ddp_find_unused_parameters=False,
@@ -359,7 +366,7 @@ def main():
         batch_size=32,
         gradient_accumulation=2,
         max_steps=400_000,
-        learning_rate=5e-4,
+        learning_rate=1e-4,
         save_steps=5000,
         val_max_examples=20000,
         do_full_validation=True,
@@ -378,7 +385,7 @@ def main():
         batch_size=16,
         gradient_accumulation=4,
         max_steps=400_000,
-        learning_rate=3e-4,
+        learning_rate=5e-5,
         save_steps=5000,
         val_max_examples=20000,
         do_full_validation=True,
@@ -397,7 +404,7 @@ def main():
         batch_size=8,
         gradient_accumulation=8,
         max_steps=200_000,
-        learning_rate=1e-4,
+        learning_rate=2e-5,
         save_steps=5000,
         val_max_examples=20000,
         do_full_validation=True,
