@@ -2,10 +2,13 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -15,6 +18,10 @@ import (
 	"time"
 	"unicode"
 )
+
+// ============================================================================
+// КОНФИГУРАЦИЯ И ТИПЫ
+// ============================================================================
 
 // CleanStats хранит статистику очистки
 type CleanStats struct {
@@ -26,7 +33,78 @@ type CleanStats struct {
 	IndexRemoved          int64
 	GarbagePatternRemoved int64
 	HighDigitRemoved      int64
+	OCRGarbageRemoved     int64 // новое
+	LanguageRemoved       int64 // новое
 }
+
+// LanguageDetectorClient HTTP-клиент к сервису определения языка
+type LanguageDetectorClient struct {
+	baseURL string
+	client  *http.Client
+}
+
+// NewLanguageDetectorClient создает нового клиента
+func NewLanguageDetectorClient(baseURL string) *LanguageDetectorClient {
+	return &LanguageDetectorClient{
+		baseURL: baseURL,
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConnsPerHost: 100,
+				MaxIdleConns:        100,
+			},
+		},
+	}
+}
+
+// DetectResult результат определения языка
+type DetectResult struct {
+	Lang          string  `json:"lang"`
+	Confidence    float64 `json:"confidence"`
+	CyrillicRatio float64 `json:"cyrillic_ratio"`
+	Keep          bool    `json:"keep"`
+}
+
+// DetectBatch определяет язык для батча текстов
+func (c *LanguageDetectorClient) DetectBatch(texts []string) ([]DetectResult, error) {
+	body := struct {
+		Texts []string `json:"texts"`
+	}{Texts: texts}
+
+	jsonBody, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.client.Post(c.baseURL+"/detect_batch", "application/json", bytes.NewReader(jsonBody))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var result struct {
+		Results []DetectResult `json:"results"`
+		Error   string         `json:"error,omitempty"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	if result.Error != "" {
+		return nil, fmt.Errorf("service error: %s", result.Error)
+	}
+
+	return result.Results, nil
+}
+
+// ============================================================================
+// РЕГУЛЯРКИ ДЛЯ ОЧИСТКИ
+// ============================================================================
 
 var (
 	urlRegex   = regexp.MustCompile(`https?://[^\s]+`)
@@ -34,7 +112,16 @@ var (
 	udkRegex   = regexp.MustCompile(`\bУДК\s*\d+(?:\.\d+)+\b`)
 	bbkRegex   = regexp.MustCompile(`\bББК\s*\d+(?:\.\d+)+\b`)
 	emailRegex = regexp.MustCompile(`[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`)
+
+	// Мусорные паттерны (одиночные буквы/цифры со скобками)
+	garbagePattern1 = regexp.MustCompile(`^[\s\[\]\(\)\{\}\d\.\,\;\-]+$`)
+	garbagePattern2 = regexp.MustCompile(`^[\[\(]\d+[\]\)]\.?\s*$`)
+	garbagePattern3 = regexp.MustCompile(`^[Сс]\.\s*\d+\.?\s*$`)
 )
+
+// ============================================================================
+// ФУНКЦИИ ОЧИСТКИ
+// ============================================================================
 
 // isIndexEntry проверяет, является ли текст предметным указателем
 func isIndexEntry(text string) bool {
@@ -43,7 +130,6 @@ func isIndexEntry(text string) bool {
 		return false
 	}
 
-	// Паттерн: текст заканчивается на цифры (возможно с запятой)
 	pattern := regexp.MustCompile(`.*?[,\s]+\d+[\s,]*$`)
 
 	matches := 0
@@ -62,17 +148,69 @@ func isIndexEntry(text string) bool {
 		return false
 	}
 
-	// Если >70% строк соответствуют паттерну — это индекс
 	return float64(matches)/float64(nonEmpty) > 0.7
 }
 
 // hasGarbagePatterns проверяет наличие мусорных паттернов
 func hasGarbagePatterns(text string) bool {
-	return urlRegex.MatchString(text) ||
+	if urlRegex.MatchString(text) ||
 		isbnRegex.MatchString(text) ||
 		udkRegex.MatchString(text) ||
 		bbkRegex.MatchString(text) ||
-		emailRegex.MatchString(text)
+		emailRegex.MatchString(text) {
+		return true
+	}
+
+	// Короткие мусорные строки
+	trimmed := strings.TrimSpace(text)
+	if len([]rune(trimmed)) < 10 {
+		if garbagePattern1.MatchString(trimmed) ||
+			garbagePattern2.MatchString(trimmed) ||
+			garbagePattern3.MatchString(trimmed) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isOCRGarbage проверяет строки с OCR-артефактами
+func isOCRGarbage(text string) bool {
+	// 1. Разреженные слова: "б а р а б а н щ и к"
+	if regexp.MustCompile(`\b\w( \w){4,}\b`).MatchString(text) {
+		return true
+	}
+
+	// 2. Одиночные буквы, разделенные пробелами, в начале
+	if regexp.MustCompile(`^[А-ЯЁ]\s+[а-яё]\s+[а-яё]`).MatchString(text) {
+		return true
+	}
+
+	// 3. Перемешаны кириллица и латиница в одном "слове"
+	if regexp.MustCompile(`\b[а-яё]+[a-z]+[а-яё]*\b`).MatchString(strings.ToLower(text)) {
+		return true
+	}
+
+	// 4. Слишком много одиночных букв
+	words := strings.Fields(text)
+	if len(words) > 5 {
+		singleLetters := 0
+		for _, w := range words {
+			if len([]rune(w)) == 1 && unicode.IsLetter([]rune(w)[0]) {
+				singleLetters++
+			}
+		}
+		if float64(singleLetters)/float64(len(words)) > 0.5 {
+			return true
+		}
+	}
+
+	// 5. Много не-буквенных символов подряд
+	if regexp.MustCompile(`[^а-яё\s]{5,}`).MatchString(strings.ToLower(text)) {
+		return true
+	}
+
+	return false
 }
 
 // digitRatio возвращает долю цифр в тексте
@@ -105,8 +243,7 @@ func letterRatio(text string) float64 {
 	return float64(letters) / float64(len(runes))
 }
 
-// cleanSentence очищает одно предложение
-// Возвращает: очищенный текст, флаг "оставить", причина удаления
+// cleanSentence очищает одно предложение (без проверки языка)
 func cleanSentence(text string) (string, bool, string) {
 	text = strings.TrimSpace(text)
 
@@ -115,7 +252,7 @@ func cleanSentence(text string) (string, bool, string) {
 		return "", false, "empty"
 	}
 
-	// 2. Мусорные паттерны (URL, ISBN, email)
+	// 2. Мусорные паттерны (URL, ISBN, email, короткий мусор)
 	if hasGarbagePatterns(text) {
 		return "", false, "garbage_pattern"
 	}
@@ -125,7 +262,12 @@ func cleanSentence(text string) (string, bool, string) {
 		return "", false, "index"
 	}
 
-	// 4. Только цифры и пунктуация (нет букв)
+	// 4. OCR-мусор
+	if isOCRGarbage(text) {
+		return "", false, "ocr_garbage"
+	}
+
+	// 5. Только цифры и пунктуация (нет букв)
 	lr := letterRatio(text)
 	if lr < 0.1 {
 		dr := digitRatio(text)
@@ -134,22 +276,29 @@ func cleanSentence(text string) (string, bool, string) {
 		}
 	}
 
-	// 5. Убираем множественные пробелы (но сохраняем \n внутри!)
-	// Не трогаем \n, так как они могут быть частью структуры (списки)
+	// 6. Убираем множественные пробелы
 	text = regexp.MustCompile(`[ \t]+`).ReplaceAllString(text, " ")
 
 	return text, true, ""
 }
 
+// ============================================================================
+// ОБРАБОТКА ФАЙЛА
+// ============================================================================
+
 // processFile обрабатывает один JSONL файл
-func processFile(inputPath, outputPath string, stats *CleanStats) error {
+func processFile(
+	inputPath, outputPath string,
+	stats *CleanStats,
+	langClient *LanguageDetectorClient,
+	filterByLanguage bool,
+) error {
 	inputFile, err := os.Open(inputPath)
 	if err != nil {
 		return err
 	}
 	defer inputFile.Close()
 
-	// Создаем выходную директорию если нужно
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
 		return err
 	}
@@ -169,6 +318,11 @@ func processFile(inputPath, outputPath string, stats *CleanStats) error {
 	var prevText string
 	var localKept int64
 
+	// Буфер для батчевой проверки языка
+	batchSize := 100
+	textBatch := make([]string, 0, batchSize)
+	sentBatch := make([]map[string]interface{}, 0, batchSize)
+
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		var sent map[string]interface{}
@@ -181,6 +335,7 @@ func processFile(inputPath, outputPath string, stats *CleanStats) error {
 			continue
 		}
 
+		// Локальная очистка (без проверки языка)
 		cleaned, keep, reason := cleanSentence(text)
 		if !keep {
 			atomic.AddInt64(&stats.Removed, 1)
@@ -193,6 +348,8 @@ func processFile(inputPath, outputPath string, stats *CleanStats) error {
 				atomic.AddInt64(&stats.IndexRemoved, 1)
 			case "high_digit_no_letters":
 				atomic.AddInt64(&stats.HighDigitRemoved, 1)
+			case "ocr_garbage":
+				atomic.AddInt64(&stats.OCRGarbageRemoved, 1)
 			}
 			continue
 		}
@@ -204,9 +361,65 @@ func processFile(inputPath, outputPath string, stats *CleanStats) error {
 		}
 
 		sent["text"] = cleaned
-		sentences = append(sentences, sent)
-		prevText = cleaned
-		localKept++
+
+		if filterByLanguage {
+			// Добавляем в батч для проверки языка
+			textBatch = append(textBatch, cleaned)
+			sentBatch = append(sentBatch, sent)
+
+			if len(textBatch) >= batchSize {
+				// Проверяем батч
+				results, err := langClient.DetectBatch(textBatch)
+				if err != nil {
+					log.Printf("ERROR language detection: %v, keeping all", err)
+					// При ошибке оставляем все
+					for _, s := range sentBatch {
+						sentences = append(sentences, s)
+						prevText = s["text"].(string)
+						localKept++
+					}
+				} else {
+					for i, result := range results {
+						if result.Keep {
+							sentences = append(sentences, sentBatch[i])
+							prevText = sentBatch[i]["text"].(string)
+							localKept++
+						} else {
+							atomic.AddInt64(&stats.Removed, 1)
+							atomic.AddInt64(&stats.LanguageRemoved, 1)
+						}
+					}
+				}
+				textBatch = textBatch[:0]
+				sentBatch = sentBatch[:0]
+			}
+		} else {
+			// Без фильтрации языка
+			sentences = append(sentences, sent)
+			prevText = cleaned
+			localKept++
+		}
+	}
+
+	// Обрабатываем остатки батча
+	if filterByLanguage && len(textBatch) > 0 {
+		results, err := langClient.DetectBatch(textBatch)
+		if err != nil {
+			for _, s := range sentBatch {
+				sentences = append(sentences, s)
+				localKept++
+			}
+		} else {
+			for i, result := range results {
+				if result.Keep {
+					sentences = append(sentences, sentBatch[i])
+					localKept++
+				} else {
+					atomic.AddInt64(&stats.Removed, 1)
+					atomic.AddInt64(&stats.LanguageRemoved, 1)
+				}
+			}
+		}
 	}
 
 	// Перезаписываем position (сохраняем порядок)
@@ -226,7 +439,10 @@ func processFile(inputPath, outputPath string, stats *CleanStats) error {
 	return scanner.Err()
 }
 
-// Progress отслеживает прогресс
+// ============================================================================
+// MAIN
+// ============================================================================
+
 type Progress struct {
 	processed int64
 	total     int64
@@ -235,14 +451,29 @@ type Progress struct {
 
 func main() {
 	var (
-		inputDir  = flag.String("input", "", "входная директория с JSONL файлами")
-		outputDir = flag.String("output", "", "выходная директория")
-		workers   = flag.Int("workers", 32, "количество воркеров")
+		inputDir           = flag.String("input", "", "входная директория с JSONL файлами")
+		outputDir          = flag.String("output", "", "выходная директория")
+		workers            = flag.Int("workers", 32, "количество воркеров")
+		langDetectorURL    = flag.String("lang-detector", "http://localhost:8092", "URL сервиса определения языка")
+		filterByLanguage   = flag.Bool("filter-lang", true, "фильтровать по языку (только русский и mixed)")
+		skipLanguageFilter = flag.Bool("skip-lang", false, "пропустить фильтрацию по языку")
 	)
 	flag.Parse()
 
 	if *inputDir == "" || *outputDir == "" {
 		log.Fatal("--input and --output are required")
+	}
+
+	// Определяем, фильтровать ли по языку
+	filterLang := *filterByLanguage && !*skipLanguageFilter
+
+	log.Printf("=== JSONL Cleaner v2 ===")
+	log.Printf("Input dir:  %s", *inputDir)
+	log.Printf("Output dir: %s", *outputDir)
+	log.Printf("Workers:    %d", *workers)
+	log.Printf("Filter by language: %v", filterLang)
+	if filterLang {
+		log.Printf("Language detector URL: %s", *langDetectorURL)
 	}
 
 	// Собираем файлы
@@ -254,6 +485,20 @@ func main() {
 
 	if len(files) == 0 {
 		log.Fatal("No JSONL files found")
+	}
+
+	// Создаем клиент детектора языка (если нужен)
+	var langClient *LanguageDetectorClient
+	if filterLang {
+		langClient = NewLanguageDetectorClient(*langDetectorURL)
+		// Проверяем доступность сервиса
+		log.Printf("Checking language detector at %s...", *langDetectorURL)
+		resp, err := http.Get(*langDetectorURL + "/health")
+		if err != nil {
+			log.Fatalf("Language detector not available: %v", err)
+		}
+		resp.Body.Close()
+		log.Printf("Language detector OK")
 	}
 
 	stats := &CleanStats{}
@@ -289,8 +534,10 @@ func main() {
 			elapsed := time.Since(progress.startTime)
 			speed := float64(processed) / elapsed.Seconds()
 			percent := float64(processed) / float64(progress.total) * 100
-			log.Printf("[PROGRESS] %d/%d files (%.1f%%), speed: %.1f files/sec, elapsed: %v",
-				processed, progress.total, percent, speed, elapsed.Round(time.Second))
+			kept := atomic.LoadInt64(&stats.Kept)
+			removed := atomic.LoadInt64(&stats.Removed)
+			log.Printf("[PROGRESS] %d/%d files (%.1f%%), speed: %.1f files/sec, kept: %d, removed: %d, elapsed: %v",
+				processed, progress.total, percent, speed, kept, removed, elapsed.Round(time.Second))
 		}
 	}()
 
@@ -301,7 +548,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			for task := range taskChan {
-				if err := processFile(task.input, task.output, stats); err != nil {
+				if err := processFile(task.input, task.output, stats, langClient, filterLang); err != nil {
 					log.Printf("ERROR processing %s: %v", task.input, err)
 				}
 				atomic.AddInt64(&progress.processed, 1)
@@ -312,7 +559,7 @@ func main() {
 	wg.Wait()
 	totalTime := time.Since(progress.startTime)
 
-	// Сохраняем статистику очистки
+	// Сохраняем статистику
 	summary := map[string]interface{}{
 		"total_files":             len(files),
 		"processed":               stats.Processed,
@@ -323,8 +570,11 @@ func main() {
 		"index_removed":           stats.IndexRemoved,
 		"garbage_pattern_removed": stats.GarbagePatternRemoved,
 		"high_digit_removed":      stats.HighDigitRemoved,
+		"ocr_garbage_removed":     stats.OCRGarbageRemoved,
+		"language_removed":        stats.LanguageRemoved,
 		"removed_percent":         float64(stats.Removed) / float64(stats.Removed+stats.Kept) * 100,
 		"cleaning_time_seconds":   totalTime.Seconds(),
+		"filter_by_language":      filterLang,
 	}
 
 	summaryPath := filepath.Join(*outputDir, "cleaning_summary.json")
@@ -344,6 +594,10 @@ func main() {
 	fmt.Printf("Index entries:    %d\n", stats.IndexRemoved)
 	fmt.Printf("Garbage patterns: %d\n", stats.GarbagePatternRemoved)
 	fmt.Printf("High digit:       %d\n", stats.HighDigitRemoved)
+	fmt.Printf("OCR garbage:      %d\n", stats.OCRGarbageRemoved)
+	if filterLang {
+		fmt.Printf("Language filter:  %d\n", stats.LanguageRemoved)
+	}
 	fmt.Printf("Time:             %v\n", totalTime.Round(time.Second))
 	fmt.Println(strings.Repeat("=", 60))
 }
