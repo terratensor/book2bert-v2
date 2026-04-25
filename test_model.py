@@ -202,7 +202,7 @@ def main():
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, required=True, help='Путь к модели')
-    parser.add_argument('--tokenizer', type=str, default='models/tokenizer/final/sp_100k.model')
+    parser.add_argument('--tokenizer', type=str, default='models/tokenizer/final/32k/sp_32k.model')
     parser.add_argument('--mode', type=str, default='interactive',
                        choices=['interactive', 'random', 'analogy', 'all'])
     parser.add_argument('--cleaned', type=str, default='data/cleaned',
@@ -283,19 +283,19 @@ def main():
         print("=" * 80)
         
         test_texts = [
-            "Москва — [MASK] России",
-            "Столица России [MASK]",
-            "The capital of France is [MASK]",
-            "Внимание — это [MASK], что вам нужно",
+            "Москва — [MASK] России.",
+            "Столица России — [MASK].",
+            "The capital of France is [MASK].",
+            "Внимание — это [MASK], что вам нужно.",
             "α = 0.[MASK]",
             "2 + 2 = [MASK]",
-            "Я [MASK] в магазин",           # ожидаем: пошёл, иду
-            "Он [MASK] книгу",              # ожидаем: читает, взял
+            "Я [MASK] в магазин.",           # ожидаем: пошёл, иду
+            "Он [MASK] книгу.",              # ожидаем: читает, взял
             "1, 2, [MASK], 4",              # ожидаем: 3
-            "Красный, жёлтый, [MASK]",     # ожидаем: синий, жёлтый
-            "Владимир Владимирович [MASK] ",
-            "Президент США [MASK] ",
-            "Здравствуйте, как [MASK]?",
+            "Красный, [MASK], жёлтый, синий.",     # ожидаем: синий, жёлтый
+            "Владимир Владимирович [MASK].",
+            "Президент Соединённых Штатов Америки — [MASK].",
+            "Здравствуйте, как вас [MASK]?",
         ]        
         
         for text in test_texts:
