@@ -2,15 +2,27 @@
 """
 Тестирование обученной BERT модели.
 Показывает, чему научилась модель на разных этапах обучения.
+
+Исправления v2:
+- Маскирование на уровне токенов (не целых слов)
+- Исправлен test_analogy (index out of bounds)
+- Улучшенные тестовые фразы
 """
 
+import os
 import torch
 import json
 import random
+import glob
+import argparse
+import numpy as np
 from transformers import BertForMaskedLM
 from simple_sp_tokenizer import SimpleSPTokenizer
-import numpy as np
 
+
+# ============================================================================
+# ЗАГРУЗКА МОДЕЛИ
+# ============================================================================
 
 def load_model(model_path, tokenizer_path):
     """Загружает модель и токенизатор."""
@@ -23,6 +35,10 @@ def load_model(model_path, tokenizer_path):
     
     return model, tokenizer
 
+
+# ============================================================================
+# MLM: ПРЕДСКАЗАНИЕ [MASK]
+# ============================================================================
 
 def predict_masked(text, model, tokenizer, top_k=5):
     """
@@ -68,159 +84,254 @@ def predict_next_word(text, model, tokenizer, top_k=5):
         text = "Москва — столица"
         returns: ["России", "мира", "СССР", "Руси", "государства"]
     """
-    # Добавляем [MASK] в конец
     text_with_mask = text + " [MASK]"
     return predict_masked(text_with_mask, model, tokenizer, top_k)
 
 
-def fill_cloze(text, model, tokenizer):
+# ============================================================================
+# МАСКИРОВАНИЕ НА УРОВНЕ ТОКЕНОВ (НОВОЕ!)
+# ============================================================================
+
+def mask_random_token(text, tokenizer):
     """
-    Заполняет все [MASK] в тексте.
+    Маскирует случайный ЗНАЧИМЫЙ токен в предложении.
+    
+    Возвращает:
+        masked_text: текст с [MASK] вместо токена
+        true_id: ID замаскированного токена
+        true_token: строка замаскированного токена (очищенная)
+    
+    Если не найдено подходящих токенов — возвращает (None, None, None).
     """
+    # Токенизируем
     encoded = tokenizer(text, max_length=512, return_tensors='pt')
+    input_ids = encoded['input_ids'][0].tolist()
+    tokens = tokenizer.convert_ids_to_tokens(input_ids)
     
-    if torch.cuda.is_available():
-        encoded = {k: v.cuda() for k, v in encoded.items()}
+    # Специальные токены, которые нельзя маскировать
+    forbidden_ids = {
+        tokenizer.cls_token_id,
+        tokenizer.sep_token_id,
+        tokenizer.pad_token_id,
+        tokenizer.mask_token_id,
+        tokenizer.unk_token_id,
+    }
     
-    mask_positions = (encoded['input_ids'][0] == tokenizer.mask_token_id).nonzero(as_tuple=True)[0]
+    # Пунктуация и одиночные символы
+    punctuation = {',', '.', '!', '?', ':', ';', '-', '—', '…', '(', ')', '[', ']', '{', '}', 
+                   '"', "'", '«', '»', '„', '“', '•', '/', '\\', '–', '―', '′', '″'}
     
-    if len(mask_positions) == 0:
-        return text
-    
-    with torch.no_grad():
-        outputs = model(**encoded)
-        logits = outputs.logits[0]
-    
-    result_tokens = tokenizer.convert_ids_to_tokens(encoded['input_ids'][0].tolist())
-    
-    for pos in mask_positions:
-        token_id = torch.argmax(logits[pos]).item()
-        result_tokens[pos] = tokenizer.convert_ids_to_tokens(token_id)
-    
-    # Декодируем обратно
-    result_text = ''.join(result_tokens).replace('▁', ' ').replace('[CLS]', '').replace('[SEP]', '').strip()
-    return result_text
-
-
-def test_analogy(word_a, word_b, word_c, model, tokenizer, top_k=5):
-    """
-    Тестирует аналогию: word_a - word_b + word_c = ?
-    
-    Example:
-        "Москва" - "Россия" + "Париж" = "Франция"
-    """
-    # Получаем эмбеддинги слов
-    def get_embedding(word):
-        ids = tokenizer.encode(word, max_length=512)
-        ids = [i for i in ids if i not in [tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.pad_token_id]]
+    # Находим "хорошие" позиции для маскирования
+    valid_positions = []
+    for i, tid in enumerate(input_ids):
+        if tid in forbidden_ids:
+            continue
         
-        if torch.cuda.is_available():
-            ids_tensor = torch.tensor([ids]).cuda()
-        else:
-            ids_tensor = torch.tensor([ids])
+        token_str = tokens[i].replace('▁', '').strip()
         
-        with torch.no_grad():
-            outputs = model.bert.embeddings.word_embeddings(ids_tensor)
-            return outputs.mean(dim=0)
+        # Пропускаем пунктуацию
+        if token_str in punctuation:
+            continue
+        
+        # Пропускаем одиночные буквы/цифры (но не в составе слова)
+        if len(token_str) <= 1 and not token_str.isalpha():
+            continue
+        
+        valid_positions.append(i)
     
-    emb_a = get_embedding(word_a)
-    emb_b = get_embedding(word_b)
-    emb_c = get_embedding(word_c)
+    if len(valid_positions) < 1:
+        return None, None, None
     
-    # Вычисляем целевой эмбеддинг
-    target_emb = emb_a - emb_b + emb_c
+    # Выбираем случайную позицию
+    mask_pos = random.choice(valid_positions)
+    true_token = tokens[mask_pos]
+    true_id = input_ids[mask_pos]
     
-    # Ищем ближайшие слова в словаре
-    word_embeddings = model.bert.embeddings.word_embeddings.weight
+    # Создаём замаскированную версию
+    masked_ids = input_ids.copy()
+    masked_ids[mask_pos] = tokenizer.mask_token_id
+    masked_text = tokenizer.decode(masked_ids, skip_special_tokens=True)
     
-    # Косинусное сходство
-    similarity = torch.cosine_similarity(target_emb.unsqueeze(0), word_embeddings)
+    # Очищаем true_token от SentencePiece артефактов
+    true_token_clean = true_token.replace('▁', '').strip()
     
-    # Исключаем входные слова
-    exclude_ids = set()
-    for word in [word_a, word_b, word_c]:
-        exclude_ids.add(tokenizer.convert_tokens_to_ids(word))
-    
-    similarity[list(exclude_ids)] = -float('inf')
-    
-    top_ids = torch.topk(similarity, top_k).indices.tolist()
-    
-    results = []
-    for tid in top_ids:
-        token = tokenizer.convert_ids_to_tokens(tid)
-        token = token.replace('▁', '').strip()
-        results.append(token)
-    
-    return results
+    return masked_text, true_id, true_token_clean
 
 
-def test_on_random_sentences(jsonl_file, model, tokenizer, num_examples=5):
+# ============================================================================
+# ТЕСТ НА СЛУЧАЙНЫХ ПРЕДЛОЖЕНИЯХ (ОБНОВЛЁН)
+# ============================================================================
+
+def test_on_random_sentences(jsonl_path, model, tokenizer, num_examples=5):
     """
-    Берёт случайные предложения из cleaned датасета и тестирует MLM.
+    Берёт случайные предложения из cleaned датасета и тестирует MLM
+    с маскированием на уровне ТОКЕНОВ.
     """
+    # Если передан путь к директории — берём случайный файл
+    if os.path.isdir(jsonl_path):
+        jsonl_files = glob.glob(f"{jsonl_path}/*.jsonl")
+        if not jsonl_files:
+            print("No JSONL files found!")
+            return []
+        jsonl_path = random.choice(jsonl_files)
+    
+    print(f"Using file: {jsonl_path}")
+    
     sentences = []
-    
-    # Читаем случайные предложения
-    with open(jsonl_file, 'r') as f:
+    with open(jsonl_path, 'r') as f:
         all_lines = f.readlines()
+        if len(all_lines) == 0:
+            return []
+        
         selected = random.sample(all_lines, min(num_examples * 10, len(all_lines)))
         
         for line in selected:
             data = json.loads(line)
             text = data.get('text', '').strip()
-            if len(text) > 20 and len(text) < 200:
+            # Берем предложения разумной длины
+            if 30 < len(text) < 300:
                 sentences.append(text)
                 if len(sentences) >= num_examples:
                     break
     
     results = []
     for sent in sentences:
-        # Случайно маскируем одно слово
-        words = sent.split()
-        if len(words) < 3:
+        masked_text, true_id, true_token = mask_random_token(sent, tokenizer)
+        if masked_text is None:
             continue
-        
-        mask_idx = random.randint(0, len(words) - 1)
-        masked_word = words[mask_idx]
-        words[mask_idx] = '[MASK]'
-        masked_text = ' '.join(words)
         
         predictions = predict_masked(masked_text, model, tokenizer, top_k=10)
         
         results.append({
             'original': sent,
             'masked': masked_text,
-            'true_word': masked_word,
-            'predictions': [p[0] for p in predictions]
+            'true_token': true_token,
+            'predictions': [p[0] for p in predictions],
+            'predictions_with_probs': predictions,
         })
     
     return results
 
 
-def main():
-    import argparse
+# ============================================================================
+# ТЕСТ АНАЛОГИЙ (ИСПРАВЛЕН)
+# ============================================================================
+
+def test_analogy(word_a, word_b, word_c, model, tokenizer, top_k=5):
+    """
+    Тестирует аналогию: word_a - word_b + word_c = ?
+    Использует ТОЛЬКО эмбеддинги первых токенов слов.
+    """
+    vocab_size = tokenizer.vocab_size
+    hidden_size = model.config.hidden_size
     
-    parser = argparse.ArgumentParser()
+    def get_single_embedding(word):
+        """Получает эмбеддинг ПЕРВОГО токена слова."""
+        tid = tokenizer.convert_tokens_to_ids(word)
+        
+        # Если слово не в словаре как единый токен — ищем его первый подтокен
+        if tid == tokenizer.unk_token_id or tid >= vocab_size:
+            ids = tokenizer.encode(word, max_length=512)
+            ids = [i for i in ids if i not in [
+                tokenizer.cls_token_id, tokenizer.sep_token_id,
+                tokenizer.pad_token_id, tokenizer.unk_token_id
+            ]]
+            if len(ids) == 0:
+                return None
+            tid = ids[0]
+        
+        if tid < 0 or tid >= vocab_size:
+            return None
+        
+        # Берём эмбеддинг из word_embeddings
+        with torch.no_grad():
+            embedding = model.bert.embeddings.word_embeddings.weight[tid]
+            return embedding.clone()
+    
+    emb_a = get_single_embedding(word_a)
+    emb_b = get_single_embedding(word_b)
+    emb_c = get_single_embedding(word_c)
+    
+    if emb_a is None or emb_b is None or emb_c is None:
+        print(f"  ⚠️  Could not find tokens for: {word_a}, {word_b}, {word_c}")
+        return []
+    
+    # Все эмбеддинги должны быть одинаковой размерности [hidden_size]
+    # Убедимся, что это так
+    assert emb_a.shape == (hidden_size,), f"emb_a shape: {emb_a.shape}"
+    assert emb_b.shape == (hidden_size,), f"emb_b shape: {emb_b.shape}"
+    assert emb_c.shape == (hidden_size,), f"emb_c shape: {emb_c.shape}"
+    
+    # Вычисляем целевой эмбеддинг
+    target_emb = emb_a - emb_b + emb_c  # [hidden_size]
+    
+    # Все эмбеддинги слов: [vocab_size, hidden_size]
+    word_embeddings = model.bert.embeddings.word_embeddings.weight
+    
+    # Приводим target_emb к [1, hidden_size] для косинусного сходства
+    target_emb = target_emb.unsqueeze(0)  # [1, hidden_size]
+    
+    # Косинусное сходство: [1, hidden_size] vs [vocab_size, hidden_size] → [vocab_size]
+    similarity = torch.cosine_similarity(target_emb, word_embeddings)  # [vocab_size]
+    
+    # Исключаем входные слова
+    exclude_ids = set()
+    for word in [word_a, word_b, word_c]:
+        tid = tokenizer.convert_tokens_to_ids(word)
+        if isinstance(tid, int) and 0 <= tid < vocab_size:
+            exclude_ids.add(tid)
+    
+    for eid in exclude_ids:
+        similarity[eid] = -float('inf')
+    
+    # Берём top_k
+    top_k = min(top_k, len(similarity) - len(exclude_ids))
+    if top_k <= 0:
+        return []
+    
+    top_ids = torch.topk(similarity, top_k).indices.tolist()
+    
+    results = []
+    for tid in top_ids:
+        if 0 <= tid < vocab_size:
+            token = tokenizer.convert_ids_to_tokens(tid)
+            token = token.replace('▁', '').strip()
+            if token:
+                results.append(token)
+    
+    return results
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="Тестирование BERT модели")
     parser.add_argument('--model', type=str, required=True, help='Путь к модели')
-    parser.add_argument('--tokenizer', type=str, default='models/tokenizer/final/32k/sp_32k.model')
-    parser.add_argument('--mode', type=str, default='interactive',
+    parser.add_argument('--tokenizer', type=str, default='models/tokenizer/multilingual/sp_42k.model')
+    parser.add_argument('--mode', type=str, default='all',
                        choices=['interactive', 'random', 'analogy', 'all'])
     parser.add_argument('--cleaned', type=str, default='data/cleaned',
                        help='Директория с JSONL для случайных примеров')
+    parser.add_argument('--num-examples', type=int, default=5,
+                       help='Количество случайных примеров')
     args = parser.parse_args()
     
     print("=" * 80)
     print(f"Loading model from {args.model}")
     model, tokenizer = load_model(args.model, args.tokenizer)
     print("Model loaded!")
+    print(f"Vocab size: {tokenizer.vocab_size}")
+    print(f"Special tokens: CLS={tokenizer.cls_token_id}, SEP={tokenizer.sep_token_id}, "
+          f"PAD={tokenizer.pad_token_id}, MASK={tokenizer.mask_token_id}")
     print("=" * 80)
     
     if args.mode == 'interactive':
         print("\nИнтерактивный режим. Введите текст с [MASK] или 'exit' для выхода.\n")
         print("Примеры:")
         print("  Москва — [MASK] России")
-        print("  The capital of France is [MASK]")
-        print("  α = 0.[MASK]")
+        print("  2 + 2 = [MASK]")
+        print("  Я [MASK] в магазин")
         print()
         
         while True:
@@ -229,12 +340,12 @@ def main():
                 break
             
             if '[MASK]' in text:
-                predictions = predict_masked(text, model, tokenizer, top_k=5)
+                predictions = predict_masked(text, model, tokenizer, top_k=10)
                 print(f"\nПредсказания для [MASK]:")
                 for i, (word, prob) in enumerate(predictions, 1):
                     print(f"  {i}. {word} ({prob:.3f})")
             else:
-                predictions = predict_next_word(text, model, tokenizer, top_k=5)
+                predictions = predict_next_word(text, model, tokenizer, top_k=10)
                 print(f"\nСледующее слово:")
                 for i, (word, prob) in enumerate(predictions, 1):
                     print(f"  {i}. {word} ({prob:.3f})")
@@ -242,84 +353,129 @@ def main():
     
     elif args.mode == 'random':
         print(f"\nТестирование на случайных предложениях из {args.cleaned}")
+        print(f"Маскирование на уровне ТОКЕНОВ (не целых слов)\n")
         
-        # Ищем первый попавшийся JSONL файл
-        import glob
-        jsonl_files = glob.glob(f"{args.cleaned}/*.jsonl")
-        if not jsonl_files:
-            print("No JSONL files found!")
+        results = test_on_random_sentences(
+            args.cleaned, model, tokenizer, num_examples=args.num_examples
+        )
+        
+        if not results:
+            print("Не удалось найти подходящие предложения.")
             return
-        
-        test_file = random.choice(jsonl_files)
-        print(f"Using file: {test_file}")
-        
-        results = test_on_random_sentences(test_file, model, tokenizer, num_examples=5)
         
         for i, r in enumerate(results, 1):
             print(f"\n--- Пример {i} ---")
-            print(f"Оригинал:    {r['original']}")
-            print(f"С маской:    {r['masked']}")
-            print(f"Правильно:   {r['true_word']}")
-            print(f"Предсказано: {', '.join(r['predictions'])}")
-            print(f"{'✅' if r['true_word'] in r['predictions'] else '❌'}")
+            print(f"Оригинал:     {r['original'][:200]}")
+            print(f"С маской:     {r['masked'][:200]}")
+            print(f"Заменили:     [{r['true_token']}]")
+            print(f"Топ-10:       {', '.join(r['predictions'][:10])}")
+            print(f"Результат:    {'✅' if r['true_token'] in r['predictions'][:5] else '❌'} "
+                  f"(в топ-5: {r['true_token'] in r['predictions'][:5]}, "
+                  f"в топ-10: {r['true_token'] in r['predictions'][:10]})")
     
     elif args.mode == 'analogy':
         print("\nТестирование аналогий:")
         
         analogies = [
-            ("Москва", "Россия", "Париж"),
-            ("король", "мужчина", "королева"),
-            ("ходить", "шёл", "бегать"),
+            ("Москва", "Россия", "Париж", "Франция"),
+            ("король", "мужчина", "королева", "женщина"),
+            ("ходить", "шёл", "бегать", "бежал"),
+            ("хороший", "лучше", "плохой", "хуже"),
         ]
         
-        for a, b, c in analogies:
-            result = test_analogy(a, b, c, model, tokenizer, top_k=3)
-            print(f"\n{a} - {b} + {c} = ?")
+        for a, b, c, expected in analogies:
+            result = test_analogy(a, b, c, model, tokenizer, top_k=5)
+            status = "✅" if expected in result else "❌"
+            print(f"\n{a} - {b} + {c} = ? (ожидается: {expected}) {status}")
             print(f"  Предсказания: {result}")
     
     elif args.mode == 'all':
+        # ====================================================================
+        # 1. MLM ТЕСТ
+        # ====================================================================
         print("\n" + "=" * 80)
-        print("1. MLM тест")
+        print("1. MLM тест (предсказание [MASK])")
         print("=" * 80)
         
         test_texts = [
+            # Простые факты
             "Москва — [MASK] России.",
             "Столица России — [MASK].",
-            "The capital of France is [MASK].",
-            "Внимание — это [MASK], что вам нужно.",
-            "α = 0.[MASK]",
-            "2 + 2 = [MASK]",
-            "Я [MASK] в магазин.",           # ожидаем: пошёл, иду
-            "Он [MASK] книгу.",              # ожидаем: читает, взял
-            "1, 2, [MASK], 4",              # ожидаем: 3
-            "Красный, [MASK], жёлтый, синий.",     # ожидаем: синий, жёлтый
+            "The capital of England is [MASK].",
+            "[MASK] is the capital of France.",
+            
+            # Грамматика
+            "Я [MASK] в магазин.",
+            "Он [MASK] книгу.",
+            
+            # Числа и последовательности
+            "1, 2, [MASK], 4.",
+            "Понедельник, вторник, [MASK], четверг.",
+            
+            # Цвета
+            "Красный, зелёный, [MASK], жёлтый.",
+            
+            # Известные люди
             "Владимир Владимирович [MASK].",
-            "Президент Соединённых Штатов Америки — [MASK].",
-            "Здравствуйте, как вас [MASK]?",
-        ]        
+            "Президент России — Владимир [MASK].",
+            
+            # Наука
+            "Вода состоит из водорода и [MASK].",
+            
+            # Математика
+            "2 + 2 = [MASK]",
+            "α = 0.[MASK]",
+        ]
         
         for text in test_texts:
             predictions = predict_masked(text, model, tokenizer, top_k=10)
             print(f"\n{text}")
-            for word, prob in predictions:
+            for word, prob in predictions[:5]:
                 print(f"  → {word} ({prob:.3f})")
         
+        # ====================================================================
+        # 2. СЛУЧАЙНЫЕ ПРЕДЛОЖЕНИЯ (МАСКИРОВАНИЕ ТОКЕНОВ)
+        # ====================================================================
         print("\n" + "=" * 80)
-        print("2. Случайные предложения из корпуса")
+        print("2. Маскирование случайных ТОКЕНОВ (не слов)")
         print("=" * 80)
         
-        import glob
-        jsonl_files = glob.glob(f"{args.cleaned}/*.jsonl")
-        if jsonl_files:
-            test_file = random.choice(jsonl_files)
-            results = test_on_random_sentences(test_file, model, tokenizer, num_examples=3)
-            
-            for r in results:
-                print(f"\nОригинал: {r['original']}")
-                print(f"Маска:    {r['masked']}")
-                print(f"Правда:   {r['true_word']}")
-                print(f"Топ-3:    {r['predictions']}")
-                print(f"Результат: {'✅' if r['true_word'] in r['predictions'] else '❌'}")
+        results = test_on_random_sentences(
+            args.cleaned, model, tokenizer, num_examples=5
+        )
+        
+        if results:
+            for i, r in enumerate(results, 1):
+                print(f"\n--- Пример {i} ---")
+                print(f"Оригинал:     {r['original'][:200]}")
+                print(f"С маской:     {r['masked'][:200]}")
+                print(f"Заменили:     [{r['true_token']}]")
+                print(f"Топ-10:       {', '.join(r['predictions'][:10])}")
+                in_top5 = r['true_token'] in r['predictions'][:5]
+                in_top10 = r['true_token'] in r['predictions'][:10]
+                print(f"Результат:    {'✅' if in_top5 else '❌'} "
+                      f"(в топ-5: {in_top5}, в топ-10: {in_top10})")
+        else:
+            print("Не удалось найти подходящие предложения.")
+        
+        # ====================================================================
+        # 3. АНАЛОГИИ
+        # ====================================================================
+        print("\n" + "=" * 80)
+        print("3. Тест аналогий")
+        print("=" * 80)
+        
+        analogies = [
+            ("Москва", "Россия", "Париж", "Франция"),
+            ("король", "мужчина", "королева", "женщина"),
+            ("ходить", "шёл", "бегать", "бежал"),
+        ]
+        
+        for a, b, c, expected in analogies:
+            result = test_analogy(a, b, c, model, tokenizer, top_k=5)
+            status = "✅" if expected in result else "❌"
+            print(f"\n{a} - {b} + {c} = ? (ожидается: {expected}) {status}")
+            print(f"  Предсказания: {result}")
 
 
 if __name__ == "__main__":
