@@ -7,12 +7,14 @@
 - Фаза 2: 256 токенов, 400k шагов  
 - Фаза 3: 512 токенов, 200k шагов
 
-Валидация:
-- Быстрая: 20k примеров каждые 5000 шагов (~2 мин)
-- Полная: весь val-датасет в конце каждой фазы (~2 часа)
-
 Запуск:
-torchrun --nproc_per_node=2 train_bert_progressive.py 2>&1 | tee phase_training.log
+  # Все фазы подряд (не рекомендуется — долго)
+  torchrun --nproc_per_node=2 train_bert_progressive.py
+
+  # Отдельная фаза
+  torchrun --nproc_per_node=2 train_bert_progressive.py --phase 1
+  torchrun --nproc_per_node=2 train_bert_progressive.py --phase 2
+  torchrun --nproc_per_node=2 train_bert_progressive.py --phase 3
 """
 
 import os
@@ -21,6 +23,7 @@ import logging
 import glob
 import json
 import time
+import argparse
 import torch
 from torch.utils.data import IterableDataset
 from transformers import (
@@ -43,6 +46,46 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# ============================================================================
+# КОНФИГУРАЦИИ ФАЗ
+# ============================================================================
+
+PHASE_CONFIGS = {
+    1: {
+        "phase_name": "phase1_128",
+        "train_file": "data/bert_multilingual/phase1_128_train.txt",
+        "val_file": "data/bert_multilingual/phase1_128_val.txt",
+        "max_length": 128,
+        "batch_size": 128,
+        "gradient_accumulation": 1,
+        "max_steps": 400_000,
+        "learning_rate": 1e-4 ,
+        "load_from": None,  # фаза 1 — с нуля
+    },
+    2: {
+        "phase_name": "phase2_256",
+        "train_file": "data/bert_multilingual/phase2_256_train.txt",
+        "val_file": "data/bert_multilingual/phase2_256_val.txt",
+        "max_length": 256,
+        "batch_size": 64,
+        "gradient_accumulation": 2,
+        "max_steps": 400_000,
+        "learning_rate": 5e-5,
+        "load_from": "models/bert-base-ml-phase1_128-final",  # загружаем веса фазы 1
+    },
+    3: {
+        "phase_name": "phase3_512",
+        "train_file": "data/bert_multilingual/phase3_512_train.txt",
+        "val_file": "data/bert_multilingual/phase3_512_val.txt",
+        "max_length": 512,
+        "batch_size": 32,
+        "gradient_accumulation": 4,
+        "max_steps": 200_000,
+        "learning_rate": 2e-5,
+        "load_from": "models/bert-base-ml-phase2_256-final",  # загружаем веса фазы 2
+    },
+}
 
 # ============================================================================
 # ПОТОКОВЫЙ ДАТАСЕТ (не загружает всё в память)
@@ -110,7 +153,7 @@ class StreamingChunkDataset(IterableDataset):
 
 def full_validation(model, tokenizer, val_file, max_length, phase_name, batch_size=32):
     """
-    Полная валидация на ВСЁМ val-датасете (1.1M примеров).
+    Полная валидация на ВСЁМ val-датасете.
     Занимает ~2 часа.
     """
     logger.info("=" * 80)
@@ -119,7 +162,6 @@ def full_validation(model, tokenizer, val_file, max_length, phase_name, batch_si
     logger.info(f"   Max length: {max_length}")
     logger.info("=" * 80)
     
-    # Полный датасет без ограничений
     full_val_dataset = StreamingChunkDataset(val_file, tokenizer, max_length)
     logger.info(f"   Full val size: {len(full_val_dataset):,} chunks")
     
@@ -129,15 +171,13 @@ def full_validation(model, tokenizer, val_file, max_length, phase_name, batch_si
         mlm_probability=0.15,
     )
     
-    # Trainer только для валидации (без логирования, без прогресс-бара)
     val_args = TrainingArguments(
-        output_dir=f"models/bert-base-ru-{phase_name}-full-val",
+        output_dir=f"models/bert-base-ml-{phase_name}-full-val",
         per_device_eval_batch_size=batch_size,
         fp16=True,
         ddp_find_unused_parameters=False,
         ddp_backend="nccl",
-        report_to=[],       # без TensorBoard
-        # disable_tqdm=True,  # без прогресс-бара
+        report_to=[],
     )
     
     trainer = Trainer(
@@ -215,8 +255,8 @@ def train_phase(
         mlm_probability=0.15,
     )
     
-    # Проверяем чекпоинты
-    output_dir = f"models/bert-base-ru-{phase_name}"
+    # Проверяем чекпоинты для восстановления внутри фазы
+    output_dir = f"models/bert-base-ml-{phase_name}"
     resume_from_checkpoint = None
     
     if os.path.exists(output_dir):
@@ -244,11 +284,13 @@ def train_phase(
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation,
+
+        average_tokens_across_devices=True, 
         
         # Сохранение
         save_strategy="steps",
         save_steps=save_steps,
-        save_total_limit=5,
+        save_total_limit=12,
         
         # Логирование
         logging_strategy="steps",
@@ -257,20 +299,26 @@ def train_phase(
         eval_strategy="steps",
         eval_steps=save_steps,
         
-        max_grad_norm=1.0,  # ← ДОБАВИТЬ
-        # lr_scheduler_type="cosine",  # ← ДОБАВИТЬ (вместо linear)
-        lr_scheduler_type="constant",  # ← ДОБАВИТЬ (вместо linear)
+        max_grad_norm=1.0,
+        lr_scheduler_type="linear",
+        gradient_checkpointing=True,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
 
         # Оптимизатор
         learning_rate=learning_rate,
         warmup_steps=int(max_steps * 0.01),
         weight_decay=0.01,
+        adam_epsilon=1e-6,
+        adam_beta1=0.9,
+        adam_beta2=0.98,
         
         # Смешанная точность
         fp16=True,
         
         # Данные
-        dataloader_num_workers=4,
+        dataloader_num_workers=8,
         
         # Логи
         report_to="tensorboard",
@@ -303,7 +351,7 @@ def train_phase(
         full_validation(model, tokenizer, val_file, max_length, phase_name, batch_size)
     
     # Сохраняем модель
-    final_output = f"models/bert-base-ru-{phase_name}-final"
+    final_output = f"models/bert-base-ml-{phase_name}-final"
     trainer.save_model(final_output)
     tokenizer.save_pretrained(final_output)
     
@@ -314,11 +362,56 @@ def train_phase(
 
 
 # ============================================================================
+# ЗАГРУЗКА МОДЕЛИ ИЗ ПРЕДЫДУЩЕЙ ФАЗЫ
+# ============================================================================
+
+def load_model_from_phase(load_path, tokenizer):
+    """
+    Загружает веса модели из финального чекпоинта предыдущей фазы.
+    Если путь не существует — создаёт модель с нуля.
+    """
+    if load_path and os.path.exists(load_path):
+        logger.info(f"📥 Loading model weights from {load_path}")
+        model = BertForMaskedLM.from_pretrained(load_path)
+        logger.info("   Weights loaded successfully")
+    else:
+        if load_path:
+            logger.warning(f"⚠️ Model path not found: {load_path}")
+            logger.warning("   Creating model from scratch")
+        else:
+            logger.info("🆕 Creating model from scratch (Phase 1)")
+        
+        config = BertConfig(
+            vocab_size=tokenizer.vocab_size,
+            hidden_size=768,
+            num_hidden_layers=12,
+            num_attention_heads=12,
+            intermediate_size=3072,
+            max_position_embeddings=512,
+            type_vocab_size=2,
+            hidden_dropout_prob=0.1,
+            attention_probs_dropout_prob=0.1,
+        )
+        
+        model = BertForMaskedLM(config)
+        config.save_pretrained("models/bert-base-ml-config")
+        logger.info("Config saved to models/bert-base-ml-config")
+    
+    params = sum(p.numel() for p in model.parameters())
+    logger.info(f"Model parameters: {params:,} total")
+    
+    return model
+
+
+# ============================================================================
 # ГЛАВНАЯ ФУНКЦИЯ
 # ============================================================================
 
 def main():
-    """Прогрессивное обучение BERT-base."""
+    parser = argparse.ArgumentParser(description="Прогрессивное обучение BERT-base")
+    parser.add_argument("--phase", type=int, choices=[1, 2, 3], default=0,
+                       help="Номер фазы для запуска (0 = все фазы подряд)")
+    args = parser.parse_args()
     
     logger.info(f"CUDA available: {torch.cuda.is_available()}")
     logger.info(f"Number of GPUs: {torch.cuda.device_count()}")
@@ -326,99 +419,57 @@ def main():
         logger.info(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
     
     # Загружаем токенизатор
-    tokenizer_path = "models/tokenizer/final/sp_100k.model"
+    tokenizer_path = "models/tokenizer/multilingual/sp_42k.model"
     logger.info(f"Loading tokenizer from {tokenizer_path}")
     tokenizer = SimpleSPTokenizer(tokenizer_path)
     logger.info(f"Vocab size: {tokenizer.vocab_size}")
     logger.info(f"Special tokens: CLS={tokenizer.cls_token_id}, SEP={tokenizer.sep_token_id}, PAD={tokenizer.pad_token_id}")
     
-    # Создаём модель BERT-base (110M параметров)
-    config = BertConfig(
-        vocab_size=tokenizer.vocab_size,
-        hidden_size=768,
-        num_hidden_layers=12,
-        num_attention_heads=12,
-        intermediate_size=3072,
-        max_position_embeddings=512,  # Сразу 512 для всех фаз!
-        type_vocab_size=2,
-        hidden_dropout_prob=0.1,
-        attention_probs_dropout_prob=0.1,
-    )
+    # Определяем, какие фазы запускать
+    if args.phase == 0:
+        phases_to_run = [1, 2, 3]
+        logger.info("🔄 Running ALL phases sequentially")
+    else:
+        phases_to_run = [args.phase]
+        logger.info(f"🔄 Running only Phase {args.phase}")
     
-    model = BertForMaskedLM(config)
+    # Загружаем модель (с нуля или из предыдущей фазы)
+    first_phase = phases_to_run[0]
+    load_from = PHASE_CONFIGS[first_phase]["load_from"]
+    model = load_model_from_phase(load_from, tokenizer)
     
-    params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Model parameters: {params:,} total")
+    # Запускаем фазы
+    for phase_num in phases_to_run:
+        config = PHASE_CONFIGS[phase_num]
+        
+        logger.info(f"\n{'=' * 80}")
+        logger.info(f"STARTING PHASE {phase_num}")
+        logger.info(f"{'=' * 80}")
+        
+        train_phase(
+            model=model,
+            tokenizer=tokenizer,
+            phase_name=config["phase_name"],
+            train_file=config["train_file"],
+            val_file=config["val_file"],
+            max_length=config["max_length"],
+            batch_size=config["batch_size"],
+            gradient_accumulation=config["gradient_accumulation"],
+            max_steps=config["max_steps"],
+            learning_rate=config["learning_rate"],
+            save_steps=5000,
+            val_max_examples=50000,
+            do_full_validation=True,
+        )
     
-    config.save_pretrained("models/bert-base-ru-config")
-    logger.info("Config saved to models/bert-base-ru-config")
-    
-    # ========================================================================
-    # ФАЗА 1: 128 токенов, 400k шагов
-    # ========================================================================
-    train_phase(
-        model=model,
-        tokenizer=tokenizer,
-        phase_name="phase1_128",
-        train_file="data/bert/phase1_128_train.txt",
-        val_file="data/bert/phase1_128_val.txt",
-        max_length=128,
-        batch_size=32,
-        gradient_accumulation=2,
-        max_steps=400_000,
-        learning_rate=1e-4,
-        save_steps=5000,
-        val_max_examples=20000,
-        do_full_validation=True,
-    )
-    
-    # ========================================================================
-    # ФАЗА 2: 256 токенов, 400k шагов
-    # ========================================================================
-    train_phase(
-        model=model,
-        tokenizer=tokenizer,
-        phase_name="phase2_256",
-        train_file="data/bert/phase2_256_train.txt",
-        val_file="data/bert/phase2_256_val.txt",
-        max_length=256,
-        batch_size=16,
-        gradient_accumulation=4,
-        max_steps=400_000,
-        learning_rate=5e-5,
-        save_steps=5000,
-        val_max_examples=20000,
-        do_full_validation=True,
-    )
-    
-    # ========================================================================
-    # ФАЗА 3: 512 токенов, 200k шагов
-    # ========================================================================
-    train_phase(
-        model=model,
-        tokenizer=tokenizer,
-        phase_name="phase3_512",
-        train_file="data/bert/phase3_512_train.txt",
-        val_file="data/bert/phase3_512_val.txt",
-        max_length=512,
-        batch_size=8,
-        gradient_accumulation=8,
-        max_steps=200_000,
-        learning_rate=2e-5,
-        save_steps=5000,
-        val_max_examples=20000,
-        do_full_validation=True,
-    )
-    
-    # ========================================================================
-    # ФИНАЛЬНОЕ СОХРАНЕНИЕ
-    # ========================================================================
-    final_output = "models/bert-base-ru-final"
-    model.save_pretrained(final_output)
-    tokenizer.save_pretrained(final_output)
-    logger.info("=" * 80)
-    logger.info(f"🎉 FINAL MODEL SAVED TO {final_output}")
-    logger.info("=" * 80)
+    # Финальное сохранение
+    if len(phases_to_run) > 1 or phases_to_run[-1] == 3:
+        final_output = "models/bert-base--final"
+        model.save_pretrained(final_output)
+        tokenizer.save_pretrained(final_output)
+        logger.info("=" * 80)
+        logger.info(f"🎉 FINAL MODEL SAVED TO {final_output}")
+        logger.info("=" * 80)
 
 
 if __name__ == "__main__":
