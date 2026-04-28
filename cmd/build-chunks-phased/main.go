@@ -391,10 +391,12 @@ func main() {
 		outputDir    = flag.String("output", "data/bert", "выходная директория")
 		workers      = flag.Int("workers", 16, "количество воркеров")
 		valRatio     = flag.Float64("val-ratio", 0.02, "доля предложений на валидацию")
+		allBooks     = flag.Bool("all-books", false, "использовать ВСЕ книги для каждой фазы")
+		phase        = flag.Int("phase", 0, "собрать только одну фазу (1, 2, или 3). 0 = все фазы")
 	)
 	flag.Parse()
 
-	log.Printf("=== Build Chunks Phased (Train/Val Split per Book) ===")
+	log.Printf("=== Build Chunks Phased (HTTP Tokenizer) ===")
 	log.Printf("Cleaned dir: %s", *cleanedDir)
 	log.Printf("Tokenizer URL: %s", *tokenizerURL)
 	log.Printf("Output dir: %s", *outputDir)
@@ -413,40 +415,56 @@ func main() {
 	log.Printf("Found %d books", len(books))
 	sort.Strings(books)
 
-	// Разбиваем книги на три фазы (разные книги для разных длин)
+	// Определяем книги для каждой фазы
 	n := len(books)
 	phaseSize := n / 3
 
-	phase1Books := books[:phaseSize]
-	phase2Books := books[phaseSize : 2*phaseSize]
-	phase3Books := books[2*phaseSize:]
+	var phase1Books, phase2Books, phase3Books []string
 
-	log.Printf("Phase 1 (128): %d books", len(phase1Books))
-	log.Printf("Phase 2 (256): %d books", len(phase2Books))
-	log.Printf("Phase 3 (512): %d books", len(phase3Books))
+	if *allBooks {
+		// ВСЕ книги для всех фаз
+		phase1Books = books
+		phase2Books = books
+		phase3Books = books
+		log.Printf("Using ALL %d books for every phase", len(books))
+	} else {
+		// Разделение на 3 части
+		phase1Books = books[:phaseSize]
+		phase2Books = books[phaseSize : 2*phaseSize]
+		phase3Books = books[2*phaseSize:]
+		log.Printf("Phase 1 (128): %d books", len(phase1Books))
+		log.Printf("Phase 2 (256): %d books", len(phase2Books))
+		log.Printf("Phase 3 (512): %d books", len(phase3Books))
+	}
 
 	// Фаза 1
-	if err := buildPhase(phase1Books, *tokenizerURL, 128,
-		filepath.Join(*outputDir, "phase1_128_train.txt"),
-		filepath.Join(*outputDir, "phase1_128_val.txt"),
-		*workers, *valRatio); err != nil {
-		log.Fatalf("Phase 1 failed: %v", err)
+	if *phase == 0 || *phase == 1 {
+		if err := buildPhase(phase1Books, *tokenizerURL, 128,
+			filepath.Join(*outputDir, "phase1_128_train.txt"),
+			filepath.Join(*outputDir, "phase1_128_val.txt"),
+			*workers, *valRatio); err != nil {
+			log.Fatalf("Phase 1 failed: %v", err)
+		}
 	}
 
 	// Фаза 2
-	if err := buildPhase(phase2Books, *tokenizerURL, 256,
-		filepath.Join(*outputDir, "phase2_256_train.txt"),
-		filepath.Join(*outputDir, "phase2_256_val.txt"),
-		*workers, *valRatio); err != nil {
-		log.Fatalf("Phase 2 failed: %v", err)
+	if *phase == 0 || *phase == 2 {
+		if err := buildPhase(phase2Books, *tokenizerURL, 256,
+			filepath.Join(*outputDir, "phase2_256_train.txt"),
+			filepath.Join(*outputDir, "phase2_256_val.txt"),
+			*workers, *valRatio); err != nil {
+			log.Fatalf("Phase 2 failed: %v", err)
+		}
 	}
 
 	// Фаза 3
-	if err := buildPhase(phase3Books, *tokenizerURL, 512,
-		filepath.Join(*outputDir, "phase3_512_train.txt"),
-		filepath.Join(*outputDir, "phase3_512_val.txt"),
-		*workers, *valRatio); err != nil {
-		log.Fatalf("Phase 3 failed: %v", err)
+	if *phase == 0 || *phase == 3 {
+		if err := buildPhase(phase3Books, *tokenizerURL, 512,
+			filepath.Join(*outputDir, "phase3_512_train.txt"),
+			filepath.Join(*outputDir, "phase3_512_val.txt"),
+			*workers, *valRatio); err != nil {
+			log.Fatalf("Phase 3 failed: %v", err)
+		}
 	}
 
 	log.Printf("=== All phases completed! ===")

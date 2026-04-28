@@ -3,17 +3,17 @@
 
 set -e
 
-CORPUS="data/tokenizer/sample_10M.txt"
-MODELS_DIR="models/tokenizer"
+CORPUS="data/tokenizer/sample_1M.txt"
+MODELS_DIR="models/tokenizer/multilingual/"
 
 mkdir -p "$MODELS_DIR"
-mkdir -p data/tokenizer
+mkdir -p data/tokenizer/
 
 echo "Sample sizes:"
 du -h data/tokenizer/sample_*.txt
 
 echo ""
-echo "=== Training tokenizers on 10M sample ==="
+echo "=== Training tokenizers on 1M sample ==="
 
 # 32k
 echo "[1/3] Training 32k vocabulary..."
@@ -29,11 +29,11 @@ spm_train \
   --user_defined_symbols="[PAD],[UNK],[CLS],[SEP],[MASK]"
 
 # 64k
-echo "[2/3] Training 64k vocabulary..."
+echo "[2/3] Training 50k vocabulary..."
 spm_train \
   --input="$CORPUS" \
-  --model_prefix="$MODELS_DIR/sp_64k" \
-  --vocab_size=64000 \
+  --model_prefix="$MODELS_DIR/sp_50k" \
+  --vocab_size=50000 \
   --character_coverage=0.9999 \
   --model_type=unigram \
   --max_sentence_length=1000000 \
@@ -42,11 +42,11 @@ spm_train \
   --user_defined_symbols="[PAD],[UNK],[CLS],[SEP],[MASK]"
 
 # 100k
-echo "[3/3] Training 100k vocabulary..."
+echo "[3/3] Training 64k vocabulary..."
 spm_train \
   --input="$CORPUS" \
-  --model_prefix="$MODELS_DIR/sp_100k" \
-  --vocab_size=100000 \
+  --model_prefix="$MODELS_DIR/sp_64k" \
+  --vocab_size=64000 \
   --character_coverage=0.9999 \
   --model_type=unigram \
   --max_sentence_length=1000000 \

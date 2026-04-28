@@ -6,6 +6,6 @@
   "cls_token": "[CLS]",
   "sep_token": "[SEP]",
   "mask_token": "[MASK]",
-  "vocab_size": 100000,
+  "vocab_size": 32000,
   "tokenizer_class": "SimpleSPTokenizer"
 }

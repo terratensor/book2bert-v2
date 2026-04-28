@@ -15,11 +15,16 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Путь к модели fastText (скачать заранее)
-MODEL_PATH = os.environ.get("FASTTEXT_MODEL", "models/fasttext/lid.176.ftz")
+# Путь к модели fastText
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DEFAULT_MODEL = os.path.join(BASE_DIR, "models", "fasttext", "lid.176.ftz")
+MODEL_PATH = os.environ.get("FASTTEXT_MODEL", DEFAULT_MODEL)
 
-# Загружаем модель при старте
 logger.info(f"Loading fastText model from {MODEL_PATH}...")
+if not os.path.exists(MODEL_PATH):
+    logger.error(f"Model not found at {MODEL_PATH}")
+    raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
+
 model = fasttext.load_model(MODEL_PATH)
 logger.info("Model loaded!")
 
@@ -32,6 +37,12 @@ def get_cyrillic_ratio(text: str) -> float:
     if total == 0:
         return 0.0
     return cyrillic / total
+
+
+def clean_text_for_fasttext(text: str) -> str:
+    """Удаляет \n и лишние пробелы для fastText."""
+    text = text.replace('\n', ' ').replace('\r', ' ')
+    return ' '.join(text.split())
 
 
 @app.route("/health", methods=["GET"])
@@ -54,24 +65,27 @@ def detect():
     if not text:
         return jsonify({"lang": "unknown", "confidence": 0.0, "cyrillic_ratio": 0.0, "keep": False})
     
+    # Очищаем текст для fastText
+    text = clean_text_for_fasttext(text)
+    if not text:
+        return jsonify({"lang": "unknown", "confidence": 0.0, "cyrillic_ratio": 0.0, "keep": False})
+    
     # fastText определяет язык
     lang, conf = model.predict(text, k=1)
     lang = lang[0].replace("__label__", "")
-    conf = conf[0]
+    conf = float(conf[0])  # ← конвертируем np.float32 в Python float
     
     # Дополнительная эвристика
     cyrillic_ratio = get_cyrillic_ratio(text)
     
-    # Правило удержания:
-    # 1. Русский с уверенностью > 0.5
-    # 2. ИЛИ доля кириллицы > 50% (mixed предложения)
+    # Правило удержания
     keep = (lang == "ru" and conf > 0.5) or cyrillic_ratio > 0.5
     
     return jsonify({
         "lang": lang,
         "confidence": round(conf, 4),
         "cyrillic_ratio": round(cyrillic_ratio, 4),
-        "keep": keep
+        "keep": bool(keep)  # ← конвертируем np.bool_ в Python bool
     })
 
 
@@ -92,7 +106,6 @@ def detect_batch():
     if not isinstance(texts, list):
         return jsonify({"error": "'texts' must be a list"}), 400
     
-    # Ограничение на размер батча
     if len(texts) > 1000:
         return jsonify({"error": f"Batch size {len(texts)} exceeds limit 1000"}), 400
     
@@ -102,19 +115,29 @@ def detect_batch():
             results.append({"lang": "unknown", "confidence": 0.0, "cyrillic_ratio": 0.0, "keep": False})
             continue
         
-        text = text.strip()
-        lang, conf = model.predict(text, k=1)
-        lang = lang[0].replace("__label__", "")
-        conf = conf[0]
-        cyrillic_ratio = get_cyrillic_ratio(text)
-        keep = (lang == "ru" and conf > 0.5) or cyrillic_ratio > 0.5
+        # Очищаем текст
+        cleaned = clean_text_for_fasttext(text.strip())
+        if not cleaned:
+            results.append({"lang": "unknown", "confidence": 0.0, "cyrillic_ratio": 0.0, "keep": False})
+            continue
         
-        results.append({
-            "lang": lang,
-            "confidence": round(conf, 4),
-            "cyrillic_ratio": round(cyrillic_ratio, 4),
-            "keep": keep
-        })
+        try:
+            lang, conf = model.predict(cleaned, k=1)
+            lang = lang[0].replace("__label__", "")
+            conf = float(conf[0])  # ← конвертируем в Python float
+            
+            cyrillic_ratio = get_cyrillic_ratio(cleaned)
+            keep = (lang == "ru" and conf > 0.5) or cyrillic_ratio > 0.5
+            
+            results.append({
+                "lang": lang,
+                "confidence": round(conf, 4),
+                "cyrillic_ratio": round(cyrillic_ratio, 4),
+                "keep": bool(keep)  # ← конвертируем в Python bool
+            })
+        except Exception as e:
+            logger.error(f"Error processing text: {e}")
+            results.append({"lang": "unknown", "confidence": 0.0, "cyrillic_ratio": 0.0, "keep": False})
     
     elapsed = (time.time() - start_time) * 1000
     logger.info(f"Batch detected {len(texts)} texts in {elapsed:.2f} ms")

@@ -1,9 +1,9 @@
 #!/bin/bash
 # train_final_tokenizer.sh
 
-VOCAB_SIZE=100000
-CORPUS="data/corpus/corpus_cleaned.txt"
-MODEL_DIR="models/tokenizer/final"
+VOCAB_SIZE=64000
+CORPUS="data/tokenizer/sample_20M.txt"
+MODEL_DIR="models/tokenizer/multilingual"
 
 mkdir -p "$MODEL_DIR"
 
@@ -13,15 +13,15 @@ echo "Output: $MODEL_DIR"
 
 spm_train \
   --input="$CORPUS" \
-  --model_prefix="$MODEL_DIR/sp_100k" \
+  --model_prefix="$MODEL_DIR/sp_64k" \
   --vocab_size=$VOCAB_SIZE \
-  --character_coverage=0.9999 \
+  --character_coverage=0.9995 \
   --model_type=unigram \
   --max_sentence_length=1000000 \
-  --input_sentence_size=50000000 \
+  --input_sentence_size=20000000 \
+  --train_extremely_large_corpus=true \
   --shuffle_input_sentence=true \
   --num_threads=32 \
-  --train_extremely_large_corpus=true \
   --user_defined_symbols="[PAD],[UNK],[CLS],[SEP],[MASK]"
 
 echo "=== Done ==="

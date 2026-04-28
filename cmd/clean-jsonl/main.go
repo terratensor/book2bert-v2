@@ -289,6 +289,7 @@ func cleanSentence(text string) (string, bool, string) {
 // processFile обрабатывает один JSONL файл
 func processFile(
 	inputPath, outputPath string,
+	removedDir string, // ← НОВЫЙ ПАРАМЕТР
 	stats *CleanStats,
 	langClient *LanguageDetectorClient,
 	filterByLanguage bool,
@@ -308,6 +309,27 @@ func processFile(
 		return err
 	}
 	defer outputFile.Close()
+
+	// Создаём файл для удалённых предложений
+	var removedFile *os.File
+	var removedWriter *bufio.Writer
+	if removedDir != "" {
+		bookID := strings.TrimSuffix(filepath.Base(inputPath), ".jsonl")
+		removedPath := filepath.Join(removedDir, bookID+".jsonl")
+
+		// Создаём директорию для книги (на случай, если removedDir не существует)
+		if err := os.MkdirAll(filepath.Dir(removedPath), 0755); err != nil {
+			return err
+		}
+
+		removedFile, err = os.Create(removedPath)
+		if err != nil {
+			return err
+		}
+		defer removedFile.Close()
+		removedWriter = bufio.NewWriter(removedFile)
+		defer removedWriter.Flush()
+	}
 
 	scanner := bufio.NewScanner(inputFile)
 	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024)
@@ -351,12 +373,34 @@ func processFile(
 			case "ocr_garbage":
 				atomic.AddInt64(&stats.OCRGarbageRemoved, 1)
 			}
+
+			// Сохраняем удалённое предложение
+			if removedWriter != nil {
+				removedSent := map[string]interface{}{
+					"text":   text,
+					"reason": reason,
+				}
+				removedData, _ := json.Marshal(removedSent)
+				removedWriter.Write(removedData)
+				removedWriter.Write([]byte("\n"))
+			}
 			continue
 		}
 
 		// Проверка на точный дубль подряд
 		if cleaned == prevText {
 			atomic.AddInt64(&stats.AdjacentDupesRemoved, 1)
+
+			// Сохраняем удалённый дубль
+			if removedWriter != nil {
+				removedSent := map[string]interface{}{
+					"text":   text,
+					"reason": "adjacent_duplicate",
+				}
+				removedData, _ := json.Marshal(removedSent)
+				removedWriter.Write(removedData)
+				removedWriter.Write([]byte("\n"))
+			}
 			continue
 		}
 
@@ -368,11 +412,9 @@ func processFile(
 			sentBatch = append(sentBatch, sent)
 
 			if len(textBatch) >= batchSize {
-				// Проверяем батч
 				results, err := langClient.DetectBatch(textBatch)
 				if err != nil {
 					log.Printf("ERROR language detection: %v, keeping all", err)
-					// При ошибке оставляем все
 					for _, s := range sentBatch {
 						sentences = append(sentences, s)
 						prevText = s["text"].(string)
@@ -387,6 +429,17 @@ func processFile(
 						} else {
 							atomic.AddInt64(&stats.Removed, 1)
 							atomic.AddInt64(&stats.LanguageRemoved, 1)
+
+							// Сохраняем удалённое по языку
+							if removedWriter != nil {
+								removedSent := map[string]interface{}{
+									"text":   textBatch[i],
+									"reason": fmt.Sprintf("language_%s", result.Lang),
+								}
+								removedData, _ := json.Marshal(removedSent)
+								removedWriter.Write(removedData)
+								removedWriter.Write([]byte("\n"))
+							}
 						}
 					}
 				}
@@ -394,7 +447,6 @@ func processFile(
 				sentBatch = sentBatch[:0]
 			}
 		} else {
-			// Без фильтрации языка
 			sentences = append(sentences, sent)
 			prevText = cleaned
 			localKept++
@@ -417,6 +469,16 @@ func processFile(
 				} else {
 					atomic.AddInt64(&stats.Removed, 1)
 					atomic.AddInt64(&stats.LanguageRemoved, 1)
+
+					if removedWriter != nil {
+						removedSent := map[string]interface{}{
+							"text":   textBatch[i],
+							"reason": fmt.Sprintf("language_%s", result.Lang),
+						}
+						removedData, _ := json.Marshal(removedSent)
+						removedWriter.Write(removedData)
+						removedWriter.Write([]byte("\n"))
+					}
 				}
 			}
 		}
@@ -453,6 +515,7 @@ func main() {
 	var (
 		inputDir           = flag.String("input", "", "входная директория с JSONL файлами")
 		outputDir          = flag.String("output", "", "выходная директория")
+		removedDir         = flag.String("removed-dir", "", "директория для удалённых предложений (если не указана — не сохраняются)")
 		workers            = flag.Int("workers", 32, "количество воркеров")
 		langDetectorURL    = flag.String("lang-detector", "http://localhost:8092", "URL сервиса определения языка")
 		filterByLanguage   = flag.Bool("filter-lang", true, "фильтровать по языку (только русский и mixed)")
@@ -462,6 +525,14 @@ func main() {
 
 	if *inputDir == "" || *outputDir == "" {
 		log.Fatal("--input and --output are required")
+	}
+
+	// Создаём директорию для удалённых (если указана)
+	if *removedDir != "" {
+		if err := os.MkdirAll(*removedDir, 0755); err != nil {
+			log.Fatalf("create removed dir: %v", err)
+		}
+		log.Printf("Removed sentences will be saved to: %s", *removedDir)
 	}
 
 	// Определяем, фильтровать ли по языку
@@ -548,7 +619,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			for task := range taskChan {
-				if err := processFile(task.input, task.output, stats, langClient, filterLang); err != nil {
+				if err := processFile(task.input, task.output, *removedDir, stats, langClient, filterLang); err != nil {
 					log.Printf("ERROR processing %s: %v", task.input, err)
 				}
 				atomic.AddInt64(&progress.processed, 1)

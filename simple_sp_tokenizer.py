@@ -215,7 +215,7 @@ class SimpleSPTokenizer:
         config_path = Path(path) / "tokenizer_config.json"
         with open(config_path) as f:
             config = json.load(f)
-        spm_path = Path(path).parent / "final" / "32k" / "sp_32k.model"
+        spm_path = Path(path).parent / "multilingual" / "sp_42k.model"
         if not spm_path.exists():
-            spm_path = "models/tokenizer/final/32k/sp_32k.model"
+            spm_path = "models/tokenizer/multilingual/sp_42k.model"
         return cls(str(spm_path))

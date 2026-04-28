@@ -170,7 +170,8 @@ func analyzeBooks(cleanedDir string, workers int) []BookStats {
 // ============================================================================
 
 // sampleFromBook выбирает count случайных строк из книги, равномерно распределённых
-func sampleFromBook(jsonlPath string, count int) []string {
+// В функции sampleFromBook:
+func sampleFromBook(jsonlPath string, count int, minLength int) []string {
 	if count <= 0 {
 		return nil
 	}
@@ -182,22 +183,19 @@ func sampleFromBook(jsonlPath string, count int) []string {
 	defer file.Close()
 
 	totalLines := countLines(jsonlPath)
-	if totalLines == 0 || totalLines < count {
-		count = totalLines
+	if totalLines == 0 {
+		return nil
 	}
 
-	step := totalLines / count
+	// Запрашиваем с запасом: в 3 раза больше, чтобы точно хватило после фильтрации
+	requestCount := count * 3
+	if requestCount > totalLines {
+		requestCount = totalLines
+	}
+
+	step := totalLines / requestCount
 	if step < 1 {
 		step = 1
-	}
-
-	positions := make(map[int]bool)
-	for i := 0; i < count; i++ {
-		pos := i * step
-		if pos >= totalLines {
-			pos = totalLines - 1
-		}
-		positions[pos] = true
 	}
 
 	var sentences []string
@@ -205,8 +203,10 @@ func sampleFromBook(jsonlPath string, count int) []string {
 	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024)
 
 	lineNum := 0
+	// Продолжаем, пока не наберём count годных предложений
 	for scanner.Scan() && len(sentences) < count {
-		if positions[lineNum] {
+		// Берём каждую step-ю строку
+		if lineNum%step == 0 || len(sentences) == 0 {
 			var sent struct {
 				Text string `json:"text"`
 			}
@@ -218,8 +218,7 @@ func sampleFromBook(jsonlPath string, count int) []string {
 				text = strings.ReplaceAll(text, "\r", " ")
 				text = strings.Join(strings.Fields(text), " ")
 
-				// ИСПРАВЛЕНИЕ 2: Минимальная длина 20 символов
-				if len([]rune(text)) >= 20 {
+				if len([]rune(text)) >= minLength {
 					sentences = append(sentences, text)
 				}
 			}
@@ -227,6 +226,7 @@ func sampleFromBook(jsonlPath string, count int) []string {
 		lineNum++
 	}
 
+	// Если не хватило (книга маленькая) — возвращаем сколько есть
 	return sentences
 }
 
@@ -236,6 +236,7 @@ func buildStratifiedSample(
 	cleanedDir string,
 	totalSampleSize int,
 	ruRatio, enRatio, mixedRatio float64,
+	minLength int,
 ) []string {
 	// Группируем книги по языкам
 	var ruBooks, enBooks, mixedBooks []BookStats
@@ -266,19 +267,9 @@ func buildStratifiedSample(
 	mixedQuota := totalSampleSize - ruQuota - enQuota
 
 	// Вычисляем предложений на книгу
-	ruPerBook := 0
-	enPerBook := 0
-	mixedPerBook := 0
-
-	if len(ruBooks) > 0 {
-		ruPerBook = ruQuota / len(ruBooks)
-	}
-	if len(enBooks) > 0 {
-		enPerBook = enQuota / len(enBooks)
-	}
-	if len(mixedBooks) > 0 {
-		mixedPerBook = mixedQuota / len(mixedBooks)
-	}
+	ruPerBook := ruQuota / len(ruBooks)
+	enPerBook := enQuota / len(enBooks)
+	mixedPerBook := mixedQuota / len(mixedBooks)
 
 	log.Printf("Sampling quotas:")
 	log.Printf("  RU:    %d sentences / %d books = %d per book", ruQuota, len(ruBooks), ruPerBook)
@@ -288,49 +279,62 @@ func buildStratifiedSample(
 	// Собираем сэмпл
 	var allSentences []string
 	var mu sync.Mutex
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 32)
 
-	log.Printf("Sampling from books...")
+	// Создаём ОБЩИЙ канал задач для ВСЕХ книг
+	type bookTask struct {
+		book    BookStats
+		perBook int
+		label   string
+	}
+
+	tasks := make(chan bookTask, len(books))
+
+	// Заполняем канал ВСЕМИ книгами
+	for _, b := range ruBooks {
+		tasks <- bookTask{b, ruPerBook, "RU"}
+	}
+	for _, b := range enBooks {
+		tasks <- bookTask{b, enPerBook, "EN"}
+	}
+	for _, b := range mixedBooks {
+		tasks <- bookTask{b, mixedPerBook, "Mixed"}
+	}
+	close(tasks)
+
+	totalTasks := len(ruBooks) + len(enBooks) + len(mixedBooks)
+	var processed int64
+
+	log.Printf("Processing %d books with 32 workers...", totalTasks)
 	startTime := time.Now()
 
-	// Функция для параллельной обработки группы книг
-	processBooks := func(books []BookStats, perBook int, label string) {
-		var processed int64
-		for _, book := range books {
-			wg.Add(1)
-			sem <- struct{}{}
-			go func(b BookStats) {
-				defer wg.Done()
-				defer func() { <-sem }()
-
-				jsonlPath := filepath.Join(cleanedDir, b.BookID+".jsonl")
-				sentences := sampleFromBook(jsonlPath, perBook)
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range tasks {
+				jsonlPath := filepath.Join(cleanedDir, task.book.BookID+".jsonl")
+				sentences := sampleFromBook(jsonlPath, task.perBook, minLength)
 
 				mu.Lock()
 				allSentences = append(allSentences, sentences...)
+				current := len(allSentences)
 				mu.Unlock()
 
 				proc := atomic.AddInt64(&processed, 1)
 				if proc%1000 == 0 {
-					mu.Lock()
-					current := len(allSentences)
-					mu.Unlock()
-					log.Printf("  [%s] %d/%d books, %d sentences collected",
-						label, proc, len(books), current)
+					log.Printf("  [%s] %d/%d books, %d valid sentences collected",
+						task.label, proc, totalTasks, current)
 				}
-			}(book)
-		}
+			}
+		}()
 	}
-
-	processBooks(ruBooks, ruPerBook, "RU")
-	processBooks(enBooks, enPerBook, "EN")
-	processBooks(mixedBooks, mixedPerBook, "Mixed")
 
 	wg.Wait()
 
 	elapsed := time.Since(startTime)
-	log.Printf("Collected %d sentences in %v", len(allSentences), elapsed.Round(time.Second))
+	log.Printf("Collected %d sentences from %d books in %v",
+		len(allSentences), totalTasks, elapsed.Round(time.Second))
 
 	return allSentences
 }
@@ -342,13 +346,14 @@ func buildStratifiedSample(
 func main() {
 	var (
 		cleanedDir = flag.String("cleaned", "data/cleaned", "директория с JSONL")
-		indexFile  = flag.String("index", "", "файл индекса book_index.jsonl (если указан — используется вместо анализа)")
+		indexFile  = flag.String("index", "", "файл индекса book_index.jsonl")
 		outputFile = flag.String("output", "data/tokenizer/sample_20M.txt", "выходной файл")
 		sampleSize = flag.Int("sample", 20000000, "размер сэмпла")
 		ruRatio    = flag.Float64("ru", 0.87, "доля русских предложений")
 		enRatio    = flag.Float64("en", 0.08, "доля английских предложений")
 		mixedRatio = flag.Float64("mixed", 0.05, "доля mixed предложений")
 		workers    = flag.Int("workers", 32, "количество воркеров")
+		minLength  = flag.Int("min-length", 30, "минимальная длина предложения в символах")
 	)
 	flag.Parse()
 
@@ -383,6 +388,7 @@ func main() {
 	sentences := buildStratifiedSample(
 		books, *cleanedDir, *sampleSize,
 		*ruRatio, *enRatio, *mixedRatio,
+		*minLength, // ← добавить параметр
 	)
 
 	// Глобально перемешиваем

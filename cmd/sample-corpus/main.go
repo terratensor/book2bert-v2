@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"flag"
+	"fmt"
 	"log"
 	"math/rand"
 	"os"
@@ -65,8 +66,8 @@ func main() {
 	defer input.Close()
 
 	// Создаем выходные файлы
-	samplePath := filepath.Join(*outputDir, "sample_10M.txt")
-	testPath := filepath.Join(*outputDir, "sample_test_1M.txt")
+	samplePath := filepath.Join(*outputDir, fmt.Sprintf("sample_%dM.txt", *sampleSize/1000000))
+	testPath := filepath.Join(*outputDir, fmt.Sprintf("sample_test_%dM.txt", *testSize/1000000))
 
 	sampleFile, err := os.Create(samplePath)
 	if err != nil {
